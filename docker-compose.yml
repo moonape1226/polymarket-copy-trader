@@ -1,0 +1,15 @@
+services:
+  copy-trader:
+    container_name: polymarket-bot
+    image: polymarket-copy-trader
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env                          # POLYMARKET_PRIVATE_KEY, POLYMARKET_PROXY_ADDRESS
+    volumes:
+      - ./config.json:/app/config.json:ro   # edit wallets/settings without rebuilding
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

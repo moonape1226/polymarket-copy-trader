@@ -2,12 +2,7 @@
 import time
 import json
 import logging
-import sys
-import os
 from ratelimit import limits, sleep_and_retry
-
-# Ensure we can import from src
-sys.path.append(os.getcwd())
 
 from src.positions import get_user_positions, detect_order_changes
 from src.trading import TradingModule
@@ -42,9 +37,10 @@ def main():
     def fetch_positions_safe(wallet_address):
         return get_user_positions(wallet_address)
     
-    # Initialize state
+    # Initialize state — pre-seed with [] so a fetch failure doesn't produce a
+    # false-new-position baseline on the first successful poll (fix #1).
     logger.info(f"Initializing state for {len(wallets)} wallets...")
-    wallet_states = {}
+    wallet_states = {wallet: [] for wallet in wallets}
     for wallet in wallets:
         positions = fetch_positions_safe(wallet)
         if positions is not None:
