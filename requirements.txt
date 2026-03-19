@@ -2,3 +2,5 @@ requests
 ratelimit
 python-dotenv
 pmxt>=2.0.4
+web3>=7.0.0
+eth-abi>=4.0.0

@@ -2,10 +2,15 @@
 import time
 import json
 import logging
+import os
 from ratelimit import limits, sleep_and_retry
+from dotenv import load_dotenv
 
 from src.positions import get_user_positions, detect_order_changes
 from src.trading import TradingModule
+from src.redeemer import redeem_resolved_positions
+
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -47,7 +52,12 @@ def main():
             wallet_states[wallet] = positions
             logger.info(f"Initialized {wallet[:8]}... with {len(positions)} positions")
 
+    private_key    = os.getenv("POLYMARKET_PRIVATE_KEY")
+    proxy_address  = os.getenv("POLYMARKET_PROXY_ADDRESS")
+    redeem_interval = config.get("redeem_interval_cycles", 60)
+
     logger.info("Starting copy trader loop...")
+    poll_cycle = 0
     try:
         while True:
             for wallet in wallets:
@@ -55,20 +65,29 @@ def main():
                     current_positions = fetch_positions_safe(wallet)
                     if current_positions is None:
                         continue
-                        
+
                     previous_positions = wallet_states.get(wallet, [])
                     changes = detect_order_changes(previous_positions, current_positions)
-                    
+
                     if changes:
                         for change in changes:
                             logger.info(f"Detected change for {wallet[:8]}: {change['type']} {change['size']} shares of {change.get('title')}")
                             trading_module.execute_copy_trade(change)
-                        
+
                     wallet_states[wallet] = current_positions
-                    
+
                 except Exception as e:
                     logger.error(f"Error tracking {wallet}: {e}")
-            
+
+            poll_cycle += 1
+            if poll_cycle % redeem_interval == 0:
+                try:
+                    redeemed = redeem_resolved_positions(private_key, proxy_address)
+                    if redeemed:
+                        logger.info(f"Redeemed {redeemed} resolved position(s)")
+                except Exception as e:
+                    logger.error(f"Redemption sweep failed: {e}")
+
             time.sleep(1) # Check every second (rate limiter handles API constraint)
 
     except KeyboardInterrupt:
