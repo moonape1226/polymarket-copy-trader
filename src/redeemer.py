@@ -147,12 +147,8 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
             # Get Safe nonce
             nonce = safe.functions.nonce().call()
 
-            # Compute Safe tx hash and sign
+            # Compute Safe tx hash and sign (raw EIP-712 hash, no prefix)
             tx_hash = _safe_tx_hash(proxy, CTF_ADDRESS, calldata_bytes, nonce, chain_id)
-            signed  = account.sign_message(
-                type("_", (), {"_body": tx_hash})()  # raw hash, no prefix
-            )
-            # For raw hash signing we use sign_hash directly
             sig_obj = Account._sign_hash(tx_hash, private_key)
             signature = sig_obj.signature
 
