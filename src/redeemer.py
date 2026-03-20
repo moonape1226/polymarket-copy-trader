@@ -26,21 +26,45 @@ RPC_URL = "https://polygon-bor-rpc.publicnode.com"
 # ── Polymarket contract addresses on Polygon ───────────────────────────────────
 CTF_ADDRESS  = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
 USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-ZERO_BYTES32 = b"\x00" * 32
+ZERO_BYTES32   = b"\x00" * 32
+ZERO_ADDRESS   = "0x0000000000000000000000000000000000000000"
 
 # ── Minimal ABIs ───────────────────────────────────────────────────────────────
-CTF_ABI = [{
-    "name": "redeemPositions",
-    "type": "function",
-    "inputs": [
-        {"name": "collateralToken",      "type": "address"},
-        {"name": "parentCollectionId",   "type": "bytes32"},
-        {"name": "conditionId",          "type": "bytes32"},
-        {"name": "indexSets",            "type": "uint256[]"},
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable",
-}]
+CTF_ABI = [
+    {
+        "name": "redeemPositions",
+        "type": "function",
+        "inputs": [
+            {"name": "collateralToken",    "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId",        "type": "bytes32"},
+            {"name": "indexSets",          "type": "uint256[]"},
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable",
+    },
+    {
+        "name": "getCollectionId",
+        "type": "function",
+        "inputs": [
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId",        "type": "bytes32"},
+            {"name": "indexSet",           "type": "uint256"},
+        ],
+        "outputs": [{"type": "bytes32"}],
+        "stateMutability": "view",
+    },
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "inputs": [
+            {"name": "owner", "type": "address"},
+            {"name": "id",    "type": "uint256"},
+        ],
+        "outputs": [{"type": "uint256"}],
+        "stateMutability": "view",
+    },
+]
 
 SAFE_ABI = [
     {"name": "nonce",        "type": "function", "inputs": [],
@@ -68,6 +92,10 @@ SAFE_TX_TYPEHASH = keccak(
 DOMAIN_SEPARATOR_TYPEHASH = keccak(
     b"EIP712Domain(uint256 chainId,address verifyingContract)"
 )
+
+
+def _hex_to_bytes(hex_str: str) -> bytes:
+    return bytes.fromhex(hex_str.removeprefix("0x"))
 
 
 def _safe_tx_hash(safe_address: str, to: str, data: bytes, nonce: int, chain_id: int) -> bytes:
@@ -123,6 +151,7 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
         return 0
 
     logger.info(f"Found {len(positions)} redeemable position(s)")
+    gas_price = w3.eth.gas_price
     redeemed = 0
 
     for pos in positions:
@@ -136,13 +165,21 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
         index_set = 1 << outcome_index
 
         try:
-            condition_bytes = bytes.fromhex(condition_id.removeprefix("0x"))
+            condition_bytes = _hex_to_bytes(condition_id)
+
+            # Skip if we have no tokens to redeem (API can lag behind on-chain state)
+            collection_id = ctf.functions.getCollectionId(ZERO_BYTES32, condition_bytes, index_set).call()
+            pos_id = int.from_bytes(keccak(bytes.fromhex(USDC_ADDRESS[2:]) + collection_id), "big")
+            balance = ctf.functions.balanceOf(proxy, pos_id).call()
+            if balance == 0:
+                logger.info(f"Skipping {title}: already redeemed (balance=0 on-chain)")
+                continue
 
             # Build redeemPositions calldata
             calldata = ctf.functions.redeemPositions(
                 USDC_ADDRESS, ZERO_BYTES32, condition_bytes, [index_set]
             ).build_transaction({"gas": 0, "gasPrice": 0, "nonce": 0, "from": proxy})["data"]
-            calldata_bytes = bytes.fromhex(calldata.removeprefix("0x"))
+            calldata_bytes = _hex_to_bytes(calldata)
 
             # Get Safe nonce
             nonce = safe.functions.nonce().call()
@@ -153,12 +190,11 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
             signature = sig_obj.signature
 
             # Build and send execTransaction
-            gas_price = w3.eth.gas_price
             tx = safe.functions.execTransaction(
                 CTF_ADDRESS, 0, calldata_bytes, 0,
                 0, 0, 0,
-                "0x0000000000000000000000000000000000000000",
-                "0x0000000000000000000000000000000000000000",
+                ZERO_ADDRESS,
+                ZERO_ADDRESS,
                 signature,
             ).build_transaction({
                 "from": account.address,
