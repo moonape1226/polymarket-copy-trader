@@ -28,6 +28,7 @@ class TradingModule:
         self.copy_percentage = max(0.0, min(float(config.get("copy_percentage", 1.0)), 1.0))
         self.min_target_shares = float(config.get("min_target_shares", 0))
         self.max_buy_price = config.get("max_buy_price")
+        self.min_trade_usd = float(config.get("min_trade_usd", 0))
         self._market_cache: Dict[str, Optional[str]] = {}
 
         self._credentials = {
@@ -50,16 +51,12 @@ class TradingModule:
         self._server_manager = _sm.ServerManager()
         logger.info("Connected.")
 
-    def _sidecar_url(self) -> str:
-        port = self._server_manager.get_server_info().get("port", 3847)
-        return f"http://localhost:{port}"
-
-    def _sidecar_token(self) -> str:
-        return self._server_manager.get_server_info().get("accessToken", "")
-
     def _create_order(self, market_id: str, outcome_id: str, side: str,
                       amount: float, fee: int = 1000) -> Dict[str, Any]:
         """Place an order via direct HTTP to the pmxt sidecar."""
+        server_info = self._server_manager.get_server_info()
+        url = f"http://localhost:{server_info.get('port', 3847)}/api/polymarket/createOrder"
+        token = server_info.get("accessToken", "")
         body = {
             "args": [{
                 "marketId": market_id,
@@ -72,11 +69,11 @@ class TradingModule:
             "credentials": self._credentials,
         }
         resp = http_requests.post(
-            f"{self._sidecar_url()}/api/polymarket/createOrder",
+            url,
             json=body,
             headers={
                 "Content-Type": "application/json",
-                "x-pmxt-access-token": self._sidecar_token(),
+                "x-pmxt-access-token": token,
             },
             timeout=15,
         )
@@ -123,6 +120,13 @@ class TradingModule:
             if our_size <= 0:
                 logger.info(f"Skipping trade: calculated size {our_size} is too small.")
                 return
+
+            # Filter: skip if estimated cost is below minimum USD threshold
+            if side == 'buy' and self.min_trade_usd > 0 and price is not None:
+                estimated_cost = our_size * float(price)
+                if estimated_cost < self.min_trade_usd:
+                    logger.info(f"Skipping buy: estimated cost ${estimated_cost:.2f} below min_trade_usd ${self.min_trade_usd:.2f}.")
+                    return
 
             cost_str = f" at ${float(price):.4f} (~${our_size * float(price):.2f})" if price is not None else ""
             logger.info(f"Copying {side} for {slug}: {our_size} shares{cost_str}")

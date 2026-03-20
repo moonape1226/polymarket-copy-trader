@@ -2,8 +2,9 @@
     "wallets_to_track": [
         "0xde17f7144fbd0eddb2679132c10ff5e74b120988"
     ],
-    "copy_percentage": 0.002,
+    "copy_percentage": 0.05,
     "trading_enabled": true,
     "min_target_shares": 500,
-    "max_buy_price": 0.95
+    "max_buy_price": 0.95,
+    "min_trade_usd": 5.0
 }
