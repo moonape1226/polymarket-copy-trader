@@ -121,11 +121,11 @@ class TradingModule:
                 logger.info(f"Skipping trade: calculated size {our_size} is too small.")
                 return
 
-            # Filter: skip if estimated cost is below minimum USD threshold
+            # Filter: skip if target's trade value is below minimum USD threshold
             if side == 'buy' and self.min_trade_usd > 0 and price is not None:
-                estimated_cost = our_size * float(price)
-                if estimated_cost < self.min_trade_usd:
-                    logger.info(f"Skipping buy: estimated cost ${estimated_cost:.2f} below min_trade_usd ${self.min_trade_usd:.2f}.")
+                target_cost = original_size * float(price)
+                if target_cost < self.min_trade_usd:
+                    logger.info(f"Skipping buy: target cost ${target_cost:.2f} below min_trade_usd ${self.min_trade_usd:.2f}.")
                     return
 
             cost_str = f" at ${float(price):.4f} (~${our_size * float(price):.2f})" if price is not None else ""
