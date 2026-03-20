@@ -6,8 +6,26 @@ import logging
 import os
 import requests
 from typing import List, Dict, Any
+from web3 import Web3
 
 logger = logging.getLogger(__name__)
+
+_RPC_URL     = "https://polygon-bor-rpc.publicnode.com"
+_USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+_USDC_ABI    = [{"name": "balanceOf", "type": "function",
+                 "inputs": [{"name": "account", "type": "address"}],
+                 "outputs": [{"type": "uint256"}], "stateMutability": "view"}]
+
+
+def _fetch_usdc_balance(proxy_address: str) -> float:
+    try:
+        w3 = Web3(Web3.HTTPProvider(_RPC_URL))
+        usdc = w3.eth.contract(address=_USDC_ADDRESS, abi=_USDC_ABI)
+        raw = usdc.functions.balanceOf(Web3.to_checksum_address(proxy_address)).call()
+        return raw / 1e6  # USDC has 6 decimals
+    except Exception as e:
+        logger.error(f"Failed to fetch USDC balance: {e}")
+        return 0.0
 
 
 def _fetch_positions(proxy_address: str) -> List[Dict[str, Any]]:
@@ -30,7 +48,8 @@ def send_portfolio_update(proxy_address: str, webhook_url: str) -> bool:
     if not positions:
         return False
 
-    total_value    = sum(float(p.get("currentValue", 0)) for p in positions)
+    usdc_cash      = _fetch_usdc_balance(proxy_address)
+    total_value    = sum(float(p.get("currentValue", 0)) for p in positions) + usdc_cash
     total_invested = sum(float(p.get("initialValue", 0)) for p in positions)
     cash_pnl       = sum(float(p.get("cashPnl", 0)) for p in positions)
     realized_pnl   = sum(float(p.get("realizedPnl", 0)) for p in positions)
@@ -52,7 +71,7 @@ def send_portfolio_update(proxy_address: str, webhook_url: str) -> bool:
     text = (
         f"{pnl_emoji} *Polymarket Portfolio Update*\n"
         f"```\n"
-        f"Current Value  : ${total_value:>10,.2f}\n"
+        f"Current Value  : ${total_value:>10,.2f}  (cash ${usdc_cash:,.2f})\n"
         f"Unrealized P&L : {sign}${abs(cash_pnl):>9,.2f}  ({sign}{pnl_pct:.1f}%)\n"
         f"Realized P&L   : ${realized_pnl:>+10,.2f}\n"
         f"Open Positions : {len(active)}\n"
