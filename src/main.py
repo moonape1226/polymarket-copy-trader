@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from src.positions import get_user_positions, detect_order_changes
 from src.trading import TradingModule
 from src.redeemer import redeem_resolved_positions
+from src.notifier import send_portfolio_update
 
 load_dotenv()
 
@@ -54,10 +55,12 @@ def main():
 
     private_key    = os.getenv("POLYMARKET_PRIVATE_KEY")
     proxy_address  = os.getenv("POLYMARKET_PROXY_ADDRESS")
+    slack_webhook  = os.getenv("SLACK_WEBHOOK_URL")
     redeem_interval = config.get("redeem_interval_cycles", 60)
 
     logger.info("Starting copy trader loop...")
     poll_cycle = 0
+    last_notify_time = 0
     try:
         while True:
             for wallet in wallets:
@@ -66,7 +69,7 @@ def main():
                     if current_positions is None:
                         continue
 
-                    previous_positions = wallet_states.get(wallet, [])
+                    previous_positions = wallet_states[wallet]
                     changes = detect_order_changes(previous_positions, current_positions)
 
                     if changes:
@@ -80,6 +83,17 @@ def main():
                     logger.error(f"Error tracking {wallet}: {e}")
 
             poll_cycle += 1
+
+            # Hourly Slack portfolio update
+            if slack_webhook:
+                now = time.time()
+                if now - last_notify_time >= 3600:
+                    try:
+                        send_portfolio_update(proxy_address, slack_webhook)
+                        last_notify_time = now
+                    except Exception as e:
+                        logger.error(f"Slack notification failed: {e}")
+
             if poll_cycle % redeem_interval == 0:
                 try:
                     redeemed = redeem_resolved_positions(private_key, proxy_address)
