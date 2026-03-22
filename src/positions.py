@@ -18,18 +18,26 @@ def _validate_positions(data: Any) -> bool:
 
 def get_user_positions(wallet_address: str) -> Optional[List[Dict[str, Any]]]:
     """
-    Fetches the current positions for a given wallet address from Polymarket.
+    Fetches all current positions for a given wallet address from Polymarket,
+    paginating through all pages to avoid the default 100-item limit.
     """
     url = f"{BASE_URL}/positions"
-    params = {"user": wallet_address}
+    all_positions: List[Dict[str, Any]] = []
+    offset = 0
+    limit = 500
     try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if not _validate_positions(data):
-            logger.error(f"Unexpected response format for {wallet_address}: {type(data)}")
-            return None
-        return data
+        while True:
+            response = requests.get(url, params={"user": wallet_address, "limit": limit, "offset": offset}, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            if not _validate_positions(data):
+                logger.error(f"Unexpected response format for {wallet_address}: {type(data)}")
+                return None
+            all_positions.extend(data)
+            if len(data) < limit:
+                break
+            offset += limit
+        return all_positions
     except Exception as e:
         logger.error(f"Error fetching positions for {wallet_address}: {e}")
         return None
