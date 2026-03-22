@@ -50,11 +50,13 @@ def detect_order_changes(
 ) -> List[Dict[str, Any]]:
     """
     Compares two lists of positions to detect executed orders.
+    Merge operations (simultaneous decrease of both YES and NO for the same
+    conditionId) are detected and excluded — they are not directional signals.
     """
     map_tn = {p['asset']: p for p in positions_tn}
     map_tn_plus_1 = {p['asset']: p for p in positions_tn_plus_1}
 
-    all_assets = set(map_tn.keys()) | set(map_tn_plus_1.keys())
+    all_assets = set(map_tn) | set(map_tn_plus_1)
     orders = []
 
     for asset in all_assets:
@@ -104,5 +106,31 @@ def detect_order_changes(
                 order.update({'type': 'SELL', 'size': size_sold, 'price': exec_price})
 
             orders.append(order)
+
+    # ── Merge detection ────────────────────────────────────────────────────────
+    # A Merge shows as simultaneous SELL on both YES and NO of the same
+    # conditionId. Group SELL changes by conditionId; if both outcomeIndex 0
+    # and 1 decreased, it's a Merge — drop both from the result.
+    sells_by_condition: Dict[str, List[Dict[str, Any]]] = {}
+    for o in orders:
+        if o['type'] == 'SELL' and o.get('conditionId'):
+            sells_by_condition.setdefault(o['conditionId'], []).append(o)
+
+    merged_assets: set = set()
+    for cid, sells in sells_by_condition.items():
+        outcome_indices = set()
+        for s in sells:
+            asset = s['asset']
+            p = map_tn.get(asset) or map_tn_plus_1.get(asset)
+            if p is not None:
+                outcome_indices.add(int(p.get('outcomeIndex', -1)))
+        if {0, 1}.issubset(outcome_indices):
+            title = sells[0].get('title', cid[:20])
+            logger.info(f"Detected Merge for '{title}' — skipping both sides")
+            for s in sells:
+                merged_assets.add(s['asset'])
+
+    if merged_assets:
+        orders = [o for o in orders if o['asset'] not in merged_assets]
 
     return orders
