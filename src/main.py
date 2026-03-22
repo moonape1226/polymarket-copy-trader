@@ -58,9 +58,15 @@ def main():
     slack_webhook  = os.getenv("SLACK_WEBHOOK_URL")
     redeem_interval = config.get("redeem_interval_cycles", 60)
 
-    logger.info("Starting copy trader loop...")
-    poll_cycle = 0
+    BATCH_WINDOW = config.get("batch_window_seconds", 180)  # 3 minutes
+
+    logger.info(f"Starting copy trader loop (batch window: {BATCH_WINDOW}s)...")
+    poll_cycle    = 0
     last_notify_time = 0
+    last_flush_time  = time.time()
+    # pending[asset_id] = {"net_size": float, "price": float, "meta": change_dict}
+    pending: dict = {}
+
     try:
         while True:
             for wallet in wallets:
@@ -72,15 +78,43 @@ def main():
                     previous_positions = wallet_states[wallet]
                     changes = detect_order_changes(previous_positions, current_positions)
 
-                    if changes:
-                        for change in changes:
-                            logger.info(f"Detected change for {wallet[:8]}: {change['type']} {change['size']} shares of {change.get('title')}")
-                            trading_module.execute_copy_trade(change)
+                    for change in changes:
+                        asset_id    = change["asset"]
+                        size        = float(change["size"])
+                        signed_size = size if change["type"].lower() == "buy" else -size
+
+                        if asset_id not in pending:
+                            pending[asset_id] = {"net_size": 0.0, "price": change.get("price"), "meta": change}
+                        pending[asset_id]["net_size"] += signed_size
+                        pending[asset_id]["price"]     = change.get("price")   # keep latest price
+                        pending[asset_id]["meta"]      = change                # keep latest metadata
+                        logger.info(
+                            f"Queued {change['type']} {size} shares of {change.get('title')} "
+                            f"(net: {pending[asset_id]['net_size']:+.2f})"
+                        )
 
                     wallet_states[wallet] = current_positions
 
                 except Exception as e:
                     logger.error(f"Error tracking {wallet}: {e}")
+
+            # ── Flush batch every BATCH_WINDOW seconds ──────────────────────
+            now = time.time()
+            if now - last_flush_time >= BATCH_WINDOW:
+                for asset_id, p in list(pending.items()):
+                    net = p["net_size"]
+                    if abs(net) < 0.01:
+                        continue
+                    synthetic = dict(p["meta"])
+                    synthetic["type"] = "buy" if net > 0 else "sell"
+                    synthetic["size"] = abs(net)
+                    logger.info(
+                        f"Flushing batch: net {synthetic['type']} {synthetic['size']:.2f} shares "
+                        f"of {synthetic.get('title')}"
+                    )
+                    trading_module.execute_copy_trade(synthetic)
+                pending.clear()
+                last_flush_time = now
 
             poll_cycle += 1
 
