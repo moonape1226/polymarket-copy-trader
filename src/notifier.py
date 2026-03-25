@@ -3,10 +3,11 @@ Sends hourly portfolio summaries to a Slack webhook.
 """
 
 import logging
-import os
 import requests
 from typing import List, Dict, Any
 from web3 import Web3
+
+from src.positions import get_user_positions
 
 logger = logging.getLogger(__name__)
 
@@ -28,23 +29,9 @@ def _fetch_usdc_balance(proxy_address: str) -> float:
         return 0.0
 
 
-def _fetch_positions(proxy_address: str) -> List[Dict[str, Any]]:
-    try:
-        r = requests.get(
-            "https://data-api.polymarket.com/positions",
-            params={"user": proxy_address, "sizeThreshold": "0.01"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.error(f"Failed to fetch positions for Slack report: {e}")
-        return []
-
-
 def send_portfolio_update(proxy_address: str, webhook_url: str) -> bool:
     """Fetch current portfolio and post a summary to Slack. Returns True on success."""
-    positions = _fetch_positions(proxy_address)
+    positions = get_user_positions(proxy_address)
     if not positions:
         return False
 
@@ -64,7 +51,7 @@ def send_portfolio_update(proxy_address: str, webhook_url: str) -> bool:
     # Top 5 positions by current value
     top = sorted(active, key=lambda p: float(p.get("currentValue", 0)), reverse=True)[:5]
     top_lines = "\n".join(
-        f"  • {p['title'][:45]} ({p['outcome']})  ${float(p['currentValue']):.2f}"
+        f"  • {p['title']} ({p['outcome']})  ${float(p['currentValue']):.2f}"
         for p in top
     ) or "  (none)"
 

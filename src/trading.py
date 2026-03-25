@@ -1,11 +1,14 @@
 import logging
 import os
 import json
+import time
 import requests as http_requests
 import pmxt
 import pmxt.server_manager as _sm
 from dotenv import load_dotenv
 from typing import Dict, Any, Optional
+from src.positions import get_user_positions
+from web3 import Web3
 
 load_dotenv()
 
@@ -13,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 
 _MARKET_CACHE_MAXSIZE = 1000
+_RPC_URL = "https://polygon-bor-rpc.publicnode.com"
+_USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+_USDC_ABI = [{"name": "balanceOf", "type": "function",
+              "inputs": [{"name": "account", "type": "address"}],
+              "outputs": [{"type": "uint256"}], "stateMutability": "view"}]
 
 
 class TradingModule:
@@ -26,10 +34,22 @@ class TradingModule:
 
         self.config = config
         self.copy_percentage = max(0.0, min(float(config.get("copy_percentage", 1.0)), 1.0))
+        self.low_prob_copy_percentage = max(0.0, min(float(config.get("low_prob_copy_percentage", self.copy_percentage)), 1.0))
+        self.low_prob_price_threshold = float(config.get("low_prob_price_threshold", 0.30))
+        self.low_prob_min_trade_usd = float(config.get("low_prob_min_trade_usd", 0))
+        self.low_prob_max_portfolio_pct = float(config.get("low_prob_max_portfolio_pct", 1.0))
         self.min_target_shares = float(config.get("min_target_shares", 0))
         self.max_buy_price = config.get("max_buy_price")
         self.min_trade_usd = float(config.get("min_trade_usd", 0))
+        self._proxy_address = proxy_address
+        self.max_position_usd = float(config.get("max_position_usd", 0))
         self._market_cache: Dict[str, Optional[str]] = {}
+        self._asset_copy_rate: Dict[str, float] = {}   # asset_id → copy_pct used on buy
+        self._asset_is_low_prob: Dict[str, bool] = {}  # asset_id → was it a low-prob buy
+        self._asset_exposure: Dict[str, float] = {}    # asset_id → USD spent on our copy
+        self._asset_shares: Dict[str, float] = {}      # asset_id → shares we hold
+        self._low_prob_exposure: float = 0.0           # USD currently in low-prob positions
+        self._exposure_last_refresh: float = 0.0       # timestamp of last exposure refresh
 
         self._credentials = {
             "apiKey": os.getenv("POLYMARKET_API_KEY"),
@@ -93,10 +113,54 @@ class TradingModule:
         self._market_cache[slug] = market_id
         return market_id
 
+    def _refresh_exposure(self):
+        """Rebuild _asset_exposure, _asset_shares, and _low_prob_exposure from on-chain positions."""
+        try:
+            all_positions = get_user_positions(self._proxy_address)
+            if all_positions is None:
+                logger.warning("Failed to refresh exposure: could not fetch positions")
+                return
+
+            new_exposure = {}
+            new_shares = {}
+            new_low_prob_exposure = 0.0
+            for p in all_positions:
+                asset_id = p.get("asset")
+                size = float(p.get("size", 0))
+                avg_price = float(p.get("avgPrice", 0))
+                if asset_id and size > 0:
+                    cost = size * avg_price
+                    new_exposure[asset_id] = cost
+                    new_shares[asset_id] = size
+                    if avg_price < self.low_prob_price_threshold:
+                        new_low_prob_exposure += cost
+            self._asset_exposure = new_exposure
+            self._asset_shares = new_shares
+            self._low_prob_exposure = new_low_prob_exposure
+            self._exposure_last_refresh = time.time()
+            logger.debug(f"Refreshed exposure: {len(new_exposure)} positions, low_prob ${new_low_prob_exposure:.2f}")
+        except Exception as e:
+            logger.warning(f"Failed to refresh exposure: {e}")
+
+    def _ensure_exposure_fresh(self):
+        if time.time() - self._exposure_last_refresh > 60:
+            self._refresh_exposure()
+
+    def _get_usdc_balance(self) -> float:
+        try:
+            w3 = Web3(Web3.HTTPProvider(_RPC_URL))
+            usdc = w3.eth.contract(address=_USDC_ADDRESS, abi=_USDC_ABI)
+            raw = usdc.functions.balanceOf(Web3.to_checksum_address(self._proxy_address)).call()
+            return raw / 1e6
+        except Exception as e:
+            logger.error(f"Failed to fetch USDC balance for cap check: {e}")
+            return float('inf')  # fail open: don't block trades if check fails
+
     def execute_copy_trade(self, trade_change: Dict[str, Any]):
         """
         Executes a copy trade based on a detected change in someone else's positions.
         """
+        self._ensure_exposure_fresh()
         try:
             side = trade_change['type'].lower()  # 'buy' or 'sell'
             asset_id = trade_change['asset']
@@ -115,21 +179,55 @@ class TradingModule:
                     logger.info(f"Skipping buy: price {float(price):.4f} exceeds ceiling {self.max_buy_price}.")
                     return
 
-            our_size = round(original_size * self.copy_percentage, 2)
+            # Determine copy rate: sells use the rate stored at buy time to stay consistent
+            if side == 'sell':
+                effective_copy_pct = self._asset_copy_rate.get(asset_id, self.copy_percentage)
+                is_low_prob = self._asset_is_low_prob.get(asset_id, False)
+            else:
+                is_low_prob = (price is not None and float(price) < self.low_prob_price_threshold)
+                effective_copy_pct = self.low_prob_copy_percentage if is_low_prob else self.copy_percentage
+
+            our_size = round(original_size * effective_copy_pct, 2)
 
             if our_size <= 0:
                 logger.info(f"Skipping trade: calculated size {our_size} is too small.")
                 return
 
             # Filter: skip if target's trade value is below minimum USD threshold
-            if side == 'buy' and self.min_trade_usd > 0 and price is not None:
+            if side == 'buy' and price is not None:
                 target_cost = original_size * float(price)
-                if target_cost < self.min_trade_usd:
-                    logger.info(f"Skipping buy: target cost ${target_cost:.2f} below min_trade_usd ${self.min_trade_usd:.2f}.")
+                min_usd = self.low_prob_min_trade_usd if is_low_prob else self.min_trade_usd
+                if min_usd > 0 and target_cost < min_usd:
+                    logger.info(f"Skipping buy: target cost ${target_cost:.2f} below min_trade_usd ${min_usd:.2f}.")
+                    return
+
+            # Per-asset cap: don't exceed max_position_usd in a single asset
+            if side == 'buy' and self.max_position_usd > 0 and price is not None:
+                order_cost = our_size * float(price)
+                current_exposure = self._asset_exposure.get(asset_id, 0.0)
+                if current_exposure + order_cost > self.max_position_usd:
+                    logger.info(
+                        f"Skipping buy: asset exposure ${current_exposure:.2f} + "
+                        f"${order_cost:.2f} would exceed ${self.max_position_usd:.0f} cap"
+                    )
+                    return
+
+            # Portfolio cap: low-prob buys must not exceed X% of USDC balance
+            if side == 'buy' and is_low_prob and price is not None:
+                order_cost = our_size * float(price)
+                usdc_balance = self._get_usdc_balance()
+                max_low_prob = usdc_balance * self.low_prob_max_portfolio_pct
+                if self._low_prob_exposure + order_cost > max_low_prob:
+                    logger.info(
+                        f"Skipping low_prob buy: exposure ${self._low_prob_exposure:.2f} + "
+                        f"${order_cost:.2f} would exceed {self.low_prob_max_portfolio_pct*100:.0f}% "
+                        f"cap (${max_low_prob:.2f} of ${usdc_balance:.2f} balance)"
+                    )
                     return
 
             cost_str = f" at ${float(price):.4f} (~${our_size * float(price):.2f})" if price is not None else ""
-            logger.info(f"Copying {side} for {slug}: {our_size} shares{cost_str}")
+            rate_str = f" [low_prob {effective_copy_pct*100:.0f}%]" if is_low_prob else f" [{effective_copy_pct*100:.1f}%]"
+            logger.info(f"Copying {side} for {slug}: {our_size} shares{cost_str}{rate_str}")
 
             if not self.config.get("trading_enabled", False):
                 logger.info("Trading disabled in config. Dry run only.")
@@ -156,6 +254,30 @@ class TradingModule:
             )
 
             logger.info(f"Success! Order ID: {order['id']}")
+
+            # Update exposure tracking
+            if side == 'buy':
+                self._asset_copy_rate[asset_id] = effective_copy_pct
+                self._asset_is_low_prob[asset_id] = is_low_prob
+                if price is not None:
+                    self._asset_exposure[asset_id] = self._asset_exposure.get(asset_id, 0.0) + our_size * float(price)
+                self._asset_shares[asset_id] = self._asset_shares.get(asset_id, 0.0) + our_size
+                if is_low_prob and price is not None:
+                    self._low_prob_exposure += our_size * float(price)
+            elif side == 'sell':
+                shares_held = self._asset_shares.get(asset_id, 0.0)
+                if shares_held > 0:
+                    fraction_sold = min(our_size / shares_held, 1.0)
+                    self._asset_exposure[asset_id] = self._asset_exposure.get(asset_id, 0.0) * (1.0 - fraction_sold)
+                    self._asset_shares[asset_id] = max(0.0, shares_held - our_size)
+                if self._asset_shares.get(asset_id, 0.0) < 0.01:
+                    self._asset_exposure.pop(asset_id, None)
+                    self._asset_shares.pop(asset_id, None)
+                    self._asset_copy_rate.pop(asset_id, None)
+                    self._asset_is_low_prob.pop(asset_id, None)
+                if is_low_prob and price is not None:
+                    self._low_prob_exposure = max(0.0, self._low_prob_exposure - our_size * float(price))
+
             return order
 
         except Exception as e:

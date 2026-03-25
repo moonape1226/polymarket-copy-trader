@@ -3,6 +3,7 @@ import time
 import json
 import logging
 import os
+import datetime
 from ratelimit import limits, sleep_and_retry
 from dotenv import load_dotenv
 
@@ -62,7 +63,7 @@ def main():
 
     logger.info(f"Starting copy trader loop (batch window: {BATCH_WINDOW}s)...")
     poll_cycle    = 0
-    last_notify_time = 0
+    last_notify_slot = -1   # tracks last notified 30-min slot (hour*2 + 0/1)
     last_flush_time  = time.time()
     # pending[asset_id] = {"net_size": float, "price": float, "meta": change_dict}
     pending: dict = {}
@@ -88,8 +89,9 @@ def main():
                         pending[asset_id]["net_size"] += signed_size
                         pending[asset_id]["price"]     = change.get("price")   # keep latest price
                         pending[asset_id]["meta"]      = change                # keep latest metadata
+                        price_str = f" @ ${float(change['price']):.3f}" if change.get('price') is not None else ""
                         logger.info(
-                            f"Queued {change['type']} {size} shares of {change.get('title')} "
+                            f"Queued {change['type']} {size} shares of {change.get('title')}{price_str} "
                             f"(net: {pending[asset_id]['net_size']:+.2f})"
                         )
 
@@ -100,6 +102,15 @@ def main():
 
             # ── Flush batch every BATCH_WINDOW seconds ──────────────────────
             now = time.time()
+            _dt = datetime.datetime.now()
+            current_slot = _dt.hour * 2 + (1 if _dt.minute >= 30 else 0)
+            if slack_webhook and current_slot != last_notify_slot:
+                last_notify_slot = current_slot  # advance first; don't retry every second on failure
+                try:
+                    send_portfolio_update(proxy_address, slack_webhook)
+                except Exception as e:
+                    logger.error(f"Slack notification failed: {e}")
+
             if now - last_flush_time >= BATCH_WINDOW:
                 for asset_id, p in list(pending.items()):
                     net = p["net_size"]
@@ -117,16 +128,6 @@ def main():
                 last_flush_time = now
 
             poll_cycle += 1
-
-            # Hourly Slack portfolio update
-            if slack_webhook:
-                now = time.time()
-                if now - last_notify_time >= 3600:
-                    try:
-                        send_portfolio_update(proxy_address, slack_webhook)
-                        last_notify_time = now
-                    except Exception as e:
-                        logger.error(f"Slack notification failed: {e}")
 
             if poll_cycle % redeem_interval == 0:
                 try:
