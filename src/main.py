@@ -60,8 +60,9 @@ def main():
     redeem_interval = config.get("redeem_interval_cycles", 60)
 
     BATCH_WINDOW = config.get("batch_window_seconds", 180)  # 3 minutes
+    MAX_PENDING  = config.get("max_pending_seconds", 300)   # 5 minutes
 
-    logger.info(f"Starting copy trader loop (batch window: {BATCH_WINDOW}s)...")
+    logger.info(f"Starting copy trader loop (batch window: {BATCH_WINDOW}s, max pending: {MAX_PENDING}s)...")
     poll_cycle    = 0
     last_notify_slot = -1   # tracks last notified 30-min slot (hour*2 + 0/1)
     last_flush_time  = time.time()
@@ -85,7 +86,7 @@ def main():
                         signed_size = size if change["type"].lower() == "buy" else -size
 
                         if asset_id not in pending:
-                            pending[asset_id] = {"net_size": 0.0, "price": change.get("price"), "meta": change}
+                            pending[asset_id] = {"net_size": 0.0, "price": change.get("price"), "meta": change, "first_seen": time.time()}
                         pending[asset_id]["net_size"] += signed_size
                         pending[asset_id]["price"]     = change.get("price")   # keep latest price
                         pending[asset_id]["meta"]      = change                # keep latest metadata
@@ -112,19 +113,41 @@ def main():
                     logger.error(f"Slack notification failed: {e}")
 
             if now - last_flush_time >= BATCH_WINDOW:
+                max_copy_pct = max(trading_module.copy_percentage, trading_module.low_prob_copy_percentage)
+                to_remove = []
                 for asset_id, p in list(pending.items()):
                     net = p["net_size"]
                     if abs(net) < 0.01:
+                        to_remove.append(asset_id)
                         continue
+
+                    price = p.get("price")
+                    age = now - p["first_seen"]
+
+                    # Carry forward buys that are too small for a $1 order (unless expired)
+                    if net > 0 and price is not None:
+                        our_cost = abs(net) * max_copy_pct * float(price)
+                        if our_cost < 1.0 and age < MAX_PENDING:
+                            continue
+
                     synthetic = dict(p["meta"])
                     synthetic["type"] = "buy" if net > 0 else "sell"
                     synthetic["size"] = abs(net)
+                    if age >= MAX_PENDING and net > 0 and price is not None:
+                        our_cost = abs(net) * max_copy_pct * float(price)
+                        if our_cost < 1.0:
+                            logger.debug(f"Expiring pending: {synthetic.get('title')} (${our_cost:.2f} after {age:.0f}s)")
+                            to_remove.append(asset_id)
+                            continue
                     logger.info(
                         f"Flushing batch: net {synthetic['type']} {synthetic['size']:.2f} shares "
                         f"of {synthetic.get('title')}"
                     )
                     trading_module.execute_copy_trade(synthetic)
-                pending.clear()
+                    to_remove.append(asset_id)
+
+                for aid in to_remove:
+                    pending.pop(aid, None)
                 last_flush_time = now
 
             poll_cycle += 1
