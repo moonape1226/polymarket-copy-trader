@@ -201,6 +201,13 @@ class TradingModule:
                     logger.info(f"Skipping buy: target cost ${target_cost:.2f} below min_trade_usd ${min_usd:.2f}.")
                     return
 
+            # Filter: skip if our copy order is below Polymarket's $1 minimum
+            if side == 'buy' and price is not None:
+                our_cost = our_size * float(price)
+                if our_cost < 1.0:
+                    logger.info(f"Skipping buy: our order value ${our_cost:.2f} below Polymarket $1 minimum.")
+                    return
+
             # Per-asset cap: don't exceed max_position_usd in a single asset
             if side == 'buy' and self.max_position_usd > 0 and price is not None:
                 order_cost = our_size * float(price)
@@ -226,7 +233,7 @@ class TradingModule:
                     return
 
             cost_str = f" at ${float(price):.4f} (~${our_size * float(price):.2f})" if price is not None else ""
-            rate_str = f" [low_prob {effective_copy_pct*100:.0f}%]" if is_low_prob else f" [{effective_copy_pct*100:.1f}%]"
+            rate_str = f" [low_prob {effective_copy_pct*100:.1f}%]" if is_low_prob else f" [{effective_copy_pct*100:.1f}%]"
             logger.info(f"Copying {side} for {slug}: {our_size} shares{cost_str}{rate_str}")
 
             if not self.config.get("trading_enabled", False):
