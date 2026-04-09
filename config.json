@@ -1,25 +1,29 @@
 {
     "wallets_to_track": [
-        "0x06dcaa14f57d8a0573f5dc5940565e6de667af59"
+        "0x331bf91c132af9d921e1908ca0979363fc47193f"
     ],
     "wallets_to_observe": {
+        "BeefSlayer": "0x331bf91c132af9d921e1908ca0979363fc47193f",
         "Big.Chungus": "0x06dcaa14f57d8a0573f5dc5940565e6de667af59",
         "sovereign2013": "0xee613b3fc183ee44f9da9c05f53e2da107e3debf",
         "pol76": "0x36e7e560c4d4cf32926906d939a18cf91f8a0b6b",
         "middleoftheocean": "0x6c743aafd813475986dcd930f380a1f50901bd4e",
         "GUHHH": "0x033dc6e3e3e0a3ae55402576990392ae910aaf05",
         "Optimus": "0xd5b97d08ec6098407bfbf66c2786ccc9967fe44e",
-        "0xde17f7": "0xde17f7144fbd0eddb2679132c10ff5e74b120988"
+        "0xde17f7": "0xde17f7144fbd0eddb2679132c10ff5e74b120988",
+        "Cashy": "0x8f42ae0a01c0383c7ca8bd060b86a645ee74b88f",
+        "Brokie": "0x1e1f17412069c0736adfaadf8ee7f46e5612c855",
+        "denizz": "0xbaa2bcb5439e985ce4ccf815b4700027d1b92c73"
     },
-    "copy_percentage": 0.1,
-    "low_prob_copy_percentage": 0.015,
+    "copy_percentage": 0.5,
+    "low_prob_copy_percentage": 1.0,
     "low_prob_price_threshold": 0.30,
-    "low_prob_min_trade_usd": 10.0,
-    "low_prob_max_portfolio_pct": 1.0,
+    "low_prob_min_trade_usd": 1.0,
+    "low_prob_max_portfolio_pct": 0.10,
     "trading_enabled": true,
     "max_buy_price": 0.99,
     "blocked_title_keywords": ["taiwan"],
-    "min_trade_usd": 10.0,
+    "min_trade_usd": 5.0,
     "max_position_usd": 1500.0,
     "batch_window_seconds": 120
 }
