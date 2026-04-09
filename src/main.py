@@ -115,9 +115,47 @@ def main():
             if now - last_flush_time >= BATCH_WINDOW:
                 max_copy_pct = max(trading_module.copy_percentage, trading_module.low_prob_copy_percentage)
                 to_remove = []
+
+                # ── Split detection: skip BUY orders that are a Split (both sides at ~$0.50, equal qty) ──
+                # A Split always prices YES and NO at exactly $0.50 each (1 USDC = 1 YES + 1 NO)
+                # and produces identical quantities. A deliberate hedge has different prices or sizes.
+                SPLIT_PRICE_TOLERANCE = 0.05
+                SPLIT_SIZE_TOLERANCE  = 0.01  # relative tolerance for size equality
+                cid_buy_info: dict = {}
+                for aid, p in pending.items():
+                    if p["net_size"] > 0:
+                        cid = p["meta"].get("conditionId")
+                        outcome = (p["meta"].get("outcome") or "").lower()
+                        price = p.get("price")
+                        if cid and outcome in ("yes", "no") and price is not None:
+                            cid_buy_info.setdefault(cid, {})[outcome] = {
+                                "price": float(price),
+                                "size": p["net_size"],
+                            }
+                hedged_cids: set = set()
+                for cid, sides in cid_buy_info.items():
+                    if "yes" in sides and "no" in sides:
+                        yes_price, no_price = sides["yes"]["price"], sides["no"]["price"]
+                        yes_size,  no_size  = sides["yes"]["size"],  sides["no"]["size"]
+                        size_ratio = abs(yes_size - no_size) / max(yes_size, no_size)
+                        if (abs(yes_price - 0.5) <= SPLIT_PRICE_TOLERANCE and
+                                abs(no_price - 0.5) <= SPLIT_PRICE_TOLERANCE and
+                                size_ratio <= SPLIT_SIZE_TOLERANCE):
+                            logger.info(
+                                f"Skipping split: both sides at ~$0.50 with equal qty "
+                                f"({yes_size:.0f} YES / {no_size:.0f} NO) for conditionId {cid[:12]}…"
+                            )
+                            hedged_cids.add(cid)
+                # ─────────────────────────────────────────────────────────────────────
+
                 for asset_id, p in list(pending.items()):
                     net = p["net_size"]
                     if abs(net) < 0.01:
+                        to_remove.append(asset_id)
+                        continue
+
+                    # Skip split/merge wash trades
+                    if net > 0 and p["meta"].get("conditionId") in hedged_cids:
                         to_remove.append(asset_id)
                         continue
 

@@ -1,3 +1,4 @@
+import csv
 import logging
 import os
 import json
@@ -15,6 +16,11 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+_BOT_TRADES_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "bot_trades.csv")
+_BOT_TRADES_FIELDS = [
+    "timestamp", "side", "title", "outcome", "asset_id", "condition_id",
+    "our_shares", "price", "our_cost", "copy_pct", "is_low_prob", "order_id",
+]
 _MARKET_CACHE_MAXSIZE = 1000
 _RPC_URL = "https://polygon-bor-rpc.publicnode.com"
 _USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
@@ -70,6 +76,32 @@ class TradingModule:
         )
         self._server_manager = _sm.ServerManager()
         logger.info("Connected.")
+
+    def _log_bot_trade(self, side: str, trade_change: Dict[str, Any],
+                       our_shares: float, our_cost: float,
+                       effective_copy_pct: float, is_low_prob: bool,
+                       order_id: str):
+        row = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+            "side": side,
+            "title": trade_change.get("title", ""),
+            "outcome": trade_change.get("outcome", ""),
+            "asset_id": trade_change.get("asset", ""),
+            "condition_id": trade_change.get("conditionId", ""),
+            "our_shares": round(our_shares, 6),
+            "price": trade_change.get("price", ""),
+            "our_cost": round(our_cost, 6),
+            "copy_pct": effective_copy_pct,
+            "is_low_prob": is_low_prob,
+            "order_id": order_id,
+        }
+        path = os.path.abspath(_BOT_TRADES_CSV)
+        write_header = not os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=_BOT_TRADES_FIELDS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
 
     def _create_order(self, market_id: str, outcome_id: str, side: str,
                       amount: float, fee: int = 1000) -> Dict[str, Any]:
@@ -179,6 +211,14 @@ class TradingModule:
                     logger.info(f"Skipping buy: price {float(price):.4f} exceeds ceiling {self.max_buy_price}.")
                     return
 
+            # Filter: skip blocked market keywords (BUY only)
+            if side == 'buy':
+                title = (trade_change.get('title') or '').lower()
+                blocked = self.config.get('blocked_title_keywords', [])
+                if any(kw.lower() in title for kw in blocked):
+                    logger.info(f"Skipping buy: blocked keyword in title — {trade_change.get('title')}")
+                    return
+
             # Determine copy rate: sells use the rate stored at buy time to stay consistent
             if side == 'sell':
                 effective_copy_pct = self._asset_copy_rate.get(asset_id, self.copy_percentage)
@@ -261,6 +301,10 @@ class TradingModule:
             )
 
             logger.info(f"Success! Order ID: {order['id']}")
+
+            our_cost = our_size * float(price) if price is not None else 0.0
+            self._log_bot_trade(side, trade_change, our_size, our_cost,
+                                effective_copy_pct, is_low_prob, order['id'])
 
             # Update exposure tracking
             if side == 'buy':

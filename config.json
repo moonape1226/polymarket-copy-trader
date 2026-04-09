@@ -1,15 +1,25 @@
 {
     "wallets_to_track": [
-        "0xde17f7144fbd0eddb2679132c10ff5e74b120988"
+        "0x06dcaa14f57d8a0573f5dc5940565e6de667af59"
     ],
-    "copy_percentage": 0.025,
-    "low_prob_copy_percentage": 0.025,
+    "wallets_to_observe": {
+        "Big.Chungus": "0x06dcaa14f57d8a0573f5dc5940565e6de667af59",
+        "sovereign2013": "0xee613b3fc183ee44f9da9c05f53e2da107e3debf",
+        "pol76": "0x36e7e560c4d4cf32926906d939a18cf91f8a0b6b",
+        "middleoftheocean": "0x6c743aafd813475986dcd930f380a1f50901bd4e",
+        "GUHHH": "0x033dc6e3e3e0a3ae55402576990392ae910aaf05",
+        "Optimus": "0xd5b97d08ec6098407bfbf66c2786ccc9967fe44e",
+        "0xde17f7": "0xde17f7144fbd0eddb2679132c10ff5e74b120988"
+    },
+    "copy_percentage": 0.1,
+    "low_prob_copy_percentage": 0.015,
     "low_prob_price_threshold": 0.30,
     "low_prob_min_trade_usd": 10.0,
     "low_prob_max_portfolio_pct": 1.0,
     "trading_enabled": true,
-    "max_buy_price": 0.93,
+    "max_buy_price": 0.99,
+    "blocked_title_keywords": ["taiwan"],
     "min_trade_usd": 10.0,
-    "max_position_usd": 500.0,
+    "max_position_usd": 1500.0,
     "batch_window_seconds": 120
 }

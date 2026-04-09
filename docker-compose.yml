@@ -8,6 +8,21 @@ services:
       - .env                          # POLYMARKET_PRIVATE_KEY, POLYMARKET_PROXY_ADDRESS
     volumes:
       - ./config.json:/app/config.json:ro   # edit wallets/settings without rebuilding
+      - ./data:/app/data                    # bot trade log output
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  trade-logger:
+    container_name: polymarket-logger
+    build:
+      context: ./tracker
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./data:/data
     logging:
       driver: json-file
       options:
