@@ -46,7 +46,7 @@ def send_portfolio_update(proxy_address: str, webhook_url: str) -> bool:
     redeemable = [p for p in positions if p.get("redeemable")]
 
     pnl_emoji = "📈" if cash_pnl >= 0 else "📉"
-    sign      = "+" if cash_pnl >= 0 else ""
+    sign      = "+" if cash_pnl >= 0 else "-"
 
     # Top 5 positions by current value
     top = sorted(active, key=lambda p: float(p.get("currentValue", 0)), reverse=True)[:5]
