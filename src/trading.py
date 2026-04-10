@@ -56,6 +56,8 @@ class TradingModule:
         self._asset_shares: Dict[str, float] = {}      # asset_id → shares we hold
         self._low_prob_exposure: float = 0.0           # USD currently in low-prob positions
         self._exposure_last_refresh: float = 0.0       # timestamp of last exposure refresh
+        self._usdc_balance_cached: float = 0.0
+        self._usdc_balance_refresh: float = 0.0
 
         self._credentials = {
             "apiKey": os.getenv("POLYMARKET_API_KEY"),
@@ -179,11 +181,15 @@ class TradingModule:
             self._refresh_exposure()
 
     def _get_usdc_balance(self) -> float:
+        if time.time() - self._usdc_balance_refresh < 60:
+            return self._usdc_balance_cached
         try:
             w3 = Web3(Web3.HTTPProvider(_RPC_URL))
             usdc = w3.eth.contract(address=_USDC_ADDRESS, abi=_USDC_ABI)
             raw = usdc.functions.balanceOf(Web3.to_checksum_address(self._proxy_address)).call()
-            return raw / 1e6
+            self._usdc_balance_cached = raw / 1e6
+            self._usdc_balance_refresh = time.time()
+            return self._usdc_balance_cached
         except Exception as e:
             logger.error(f"Failed to fetch USDC balance for cap check: {e}")
             return float('inf')  # fail open: don't block trades if check fails
@@ -259,18 +265,31 @@ class TradingModule:
                     )
                     return
 
-            # Portfolio cap: low-prob buys must not exceed X% of USDC balance
+            # Portfolio cap: low-prob buys must not exceed X% of total portfolio
             if side == 'buy' and is_low_prob and price is not None:
                 order_cost = our_size * float(price)
                 usdc_balance = self._get_usdc_balance()
-                max_low_prob = usdc_balance * self.low_prob_max_portfolio_pct
-                if self._low_prob_exposure + order_cost > max_low_prob:
+                total_portfolio = usdc_balance + sum(self._asset_exposure.values())
+                max_low_prob = total_portfolio * self.low_prob_max_portfolio_pct
+                remaining = max(0.0, max_low_prob - self._low_prob_exposure)
+                if remaining < 1.0:
                     logger.info(
-                        f"Skipping low_prob buy: exposure ${self._low_prob_exposure:.2f} + "
-                        f"${order_cost:.2f} would exceed {self.low_prob_max_portfolio_pct*100:.0f}% "
-                        f"cap (${max_low_prob:.2f} of ${usdc_balance:.2f} balance)"
+                        f"Skipping low_prob buy: cap headroom ${remaining:.2f} below $1 minimum "
+                        f"({self.low_prob_max_portfolio_pct*100:.0f}% cap = ${max_low_prob:.2f} of ${total_portfolio:.2f} portfolio)"
                     )
                     return
+                if order_cost > remaining:
+                    reduced_size = round(remaining / float(price), 2)
+                    if reduced_size * float(price) < 1.0:
+                        logger.info(
+                            f"Skipping low_prob buy: reduced size ${reduced_size * float(price):.2f} below $1 minimum."
+                        )
+                        return
+                    logger.info(
+                        f"Reducing low_prob buy from {our_size:.2f} to {reduced_size:.2f} shares "
+                        f"(${order_cost:.2f} → ${remaining:.2f} to fit cap)"
+                    )
+                    our_size = reduced_size
 
             cost_str = f" at ${float(price):.4f} (~${our_size * float(price):.2f})" if price is not None else ""
             rate_str = f" [low_prob {effective_copy_pct*100:.1f}%]" if is_low_prob else f" [{effective_copy_pct*100:.1f}%]"
