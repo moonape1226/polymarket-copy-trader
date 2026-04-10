@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import datetime
+import requests
 from ratelimit import limits, sleep_and_retry
 from dotenv import load_dotenv
 
@@ -28,31 +29,45 @@ def load_config():
     with open(CONFIG_FILE, 'r') as f:
         return json.load(f)
 
+
+def _fetch_activity_sells(wallet: str) -> list:
+    """Fetch recent SELL trades for a wallet from the Polymarket activity API."""
+    try:
+        resp = requests.get(
+            "https://data-api.polymarket.com/activity",
+            params={"user": wallet, "limit": 50},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return [
+            r for r in resp.json()
+            if r.get("type") == "TRADE" and r.get("side", "").upper() == "SELL"
+        ]
+    except Exception as e:
+        logger.warning(f"Activity fetch failed for {wallet[:8]}…: {e}")
+        return []
+
+
 def main():
     config = load_config()
     wallets = config.get("wallets_to_track", [])
     rate_limit = config.get("rate_limit", 25)
-    
+
     if not wallets:
         logger.error("No wallets to track in config.")
         return
 
     trading_module = TradingModule(config)
-    
+
     @sleep_and_retry
     @limits(calls=rate_limit, period=10)
     def fetch_positions_safe(wallet_address):
         return get_user_positions(wallet_address)
-    
+
     # Initialize state — pre-seed with [] so a fetch failure doesn't produce a
-    # false-new-position baseline on the first successful poll (fix #1).
+    # false-new-position baseline on the first successful poll.
     logger.info(f"Initializing state for {len(wallets)} wallets...")
     wallet_states = {wallet: [] for wallet in wallets}
-    # Tracks the timestamp when each asset first went absent per wallet.
-    # A position must be missing for SELL_CONFIRM_SECONDS before being treated
-    # as a real sell, filtering API dropouts that typically resolve within ~5s.
-    SELL_CONFIRM_SECONDS = config.get("sell_confirm_seconds", 10)
-    absent_since: dict = {wallet: {} for wallet in wallets}
     for wallet in wallets:
         positions = fetch_positions_safe(wallet)
         if positions is not None:
@@ -64,14 +79,28 @@ def main():
     slack_webhook  = os.getenv("SLACK_WEBHOOK_URL")
     redeem_interval = config.get("redeem_interval_cycles", 60)
 
-    BATCH_WINDOW = config.get("batch_window_seconds", 180)  # 3 minutes
-    MAX_PENDING  = config.get("max_pending_seconds", 300)   # 5 minutes
+    BATCH_WINDOW = config.get("batch_window_seconds", 180)
+    MAX_PENDING  = config.get("max_pending_seconds", 300)
+    # How long to wait for /activity confirmation before discarding a sell as flicker.
+    # Polymarket activity indexing takes 13–42s empirically; 60s gives comfortable margin.
+    SELL_CONFIRM_SECONDS = config.get("sell_confirm_seconds", 60)
+    # Poll /activity every N seconds to validate pending sells.
+    ACTIVITY_POLL_INTERVAL = config.get("activity_poll_interval", 10)
+    # Look back this far in activity timestamps when confirming a sell.
+    ACTIVITY_WINDOW = 300
 
-    logger.info(f"Starting copy trader loop (batch window: {BATCH_WINDOW}s, max pending: {MAX_PENDING}s)...")
+    # activity_sells: asset_id → most recent on-chain sell timestamp (Unix seconds)
+    # Populated by polling /activity; used to validate pending SELL signals from /positions.
+    activity_sells: dict = {}
+    last_activity_poll: float = 0.0
+
+    logger.info(
+        f"Starting copy trader loop (batch window: {BATCH_WINDOW}s, "
+        f"sell confirm: {SELL_CONFIRM_SECONDS}s, activity poll: {ACTIVITY_POLL_INTERVAL}s)..."
+    )
     poll_cycle    = 0
-    last_notify_slot = -1   # tracks last notified 30-min slot (hour*2 + 0/1)
+    last_notify_slot = -1
     last_flush_time  = time.time()
-    # pending[asset_id] = {"net_size": float, "price": float, "meta": change_dict}
     pending: dict = {}
 
     try:
@@ -83,35 +112,7 @@ def main():
                         continue
 
                     previous_positions = wallet_states[wallet]
-                    curr_map = {p['asset']: p for p in current_positions}
-                    prev_map = {p['asset']: p for p in previous_positions}
-                    now_ts = time.time()
-
-                    # Reset timer for positions that returned
-                    for asset_id in list(absent_since[wallet].keys()):
-                        if asset_id in curr_map:
-                            del absent_since[wallet][asset_id]
-
-                    # Record first-seen timestamp for newly absent positions
-                    for asset_id in prev_map:
-                        if asset_id not in curr_map and asset_id not in absent_since[wallet]:
-                            absent_since[wallet][asset_id] = now_ts
-
-                    # Build stable view: ghost back positions absent less than SELL_CONFIRM_SECONDS.
-                    # Polymarket /positions API has ~5s dropouts; 10s threshold filters them
-                    # without meaningfully delaying real sell detection.
-                    stable_current = list(current_positions)
-                    for asset_id, first_absent in absent_since[wallet].items():
-                        if now_ts - first_absent < SELL_CONFIRM_SECONDS and asset_id in prev_map:
-                            stable_current.append(prev_map[asset_id])
-                            logger.info(f"Holding ghost position {asset_id[:12]}… (absent {now_ts - first_absent:.1f}s)")
-
-                    changes = detect_order_changes(previous_positions, stable_current)
-
-                    # Clean up timer for confirmed sells
-                    for change in changes:
-                        if change["type"].upper() == "SELL":
-                            absent_since[wallet].pop(change["asset"], None)
+                    changes = detect_order_changes(previous_positions, current_positions)
 
                     for change in changes:
                         asset_id    = change["asset"]
@@ -121,39 +122,53 @@ def main():
                         if asset_id not in pending:
                             pending[asset_id] = {"net_size": 0.0, "price": change.get("price"), "meta": change, "first_seen": time.time()}
                         pending[asset_id]["net_size"] += signed_size
-                        pending[asset_id]["price"]     = change.get("price")   # keep latest price
-                        pending[asset_id]["meta"]      = change                # keep latest metadata
+                        pending[asset_id]["price"]     = change.get("price")
+                        pending[asset_id]["meta"]      = change
                         price_str = f" @ ${float(change['price']):.3f}" if change.get('price') is not None else ""
                         logger.info(
                             f"Queued {change['type']} {size} shares of {change.get('title')}{price_str} "
                             f"(net: {pending[asset_id]['net_size']:+.2f})"
                         )
 
-                    wallet_states[wallet] = stable_current
+                    wallet_states[wallet] = current_positions
 
                 except Exception as e:
                     logger.error(f"Error tracking {wallet}: {e}")
 
-            # ── Flush batch every BATCH_WINDOW seconds ──────────────────────
             now = time.time()
+
+            # ── Poll /activity to validate pending sells ─────────────────────
+            if now - last_activity_poll >= ACTIVITY_POLL_INTERVAL:
+                for wallet in wallets:
+                    for r in _fetch_activity_sells(wallet):
+                        asset_id = r.get("asset", "")
+                        ts = int(r.get("timestamp", 0))
+                        if asset_id and ts:
+                            activity_sells[asset_id] = max(activity_sells.get(asset_id, 0), ts)
+                # Prune entries older than ACTIVITY_WINDOW
+                cutoff = now - ACTIVITY_WINDOW
+                activity_sells = {k: v for k, v in activity_sells.items() if v > cutoff}
+                last_activity_poll = now
+
+            # ── Slack portfolio summary every 30 minutes ─────────────────────
             _dt = datetime.datetime.now()
             current_slot = _dt.hour * 2 + (1 if _dt.minute >= 30 else 0)
             if slack_webhook and current_slot != last_notify_slot:
-                last_notify_slot = current_slot  # advance first; don't retry every second on failure
+                last_notify_slot = current_slot
                 try:
                     send_portfolio_update(proxy_address, slack_webhook)
                 except Exception as e:
                     logger.error(f"Slack notification failed: {e}")
 
+            # ── Flush batch every BATCH_WINDOW seconds ───────────────────────
             if now - last_flush_time >= BATCH_WINDOW:
                 max_copy_pct = max(trading_module.copy_percentage, trading_module.low_prob_copy_percentage)
                 to_remove = []
 
-                # ── Split detection: skip BUY orders that are a Split (both sides at ~$0.50, equal qty) ──
-                # A Split always prices YES and NO at exactly $0.50 each (1 USDC = 1 YES + 1 NO)
-                # and produces identical quantities. A deliberate hedge has different prices or sizes.
+                # Split detection: skip BUY orders where both YES and NO were bought
+                # at ~$0.50 with equal size (1 USDC = 1 YES + 1 NO split operation).
                 SPLIT_PRICE_TOLERANCE = 0.05
-                SPLIT_SIZE_TOLERANCE  = 0.01  # relative tolerance for size equality
+                SPLIT_SIZE_TOLERANCE  = 0.01
                 cid_buy_info: dict = {}
                 for aid, p in pending.items():
                     if p["net_size"] > 0:
@@ -179,7 +194,6 @@ def main():
                                 f"({yes_size:.0f} YES / {no_size:.0f} NO) for conditionId {cid[:12]}…"
                             )
                             hedged_cids.add(cid)
-                # ─────────────────────────────────────────────────────────────────────
 
                 for asset_id, p in list(pending.items()):
                     net = p["net_size"]
@@ -187,7 +201,6 @@ def main():
                         to_remove.append(asset_id)
                         continue
 
-                    # Skip split/merge wash trades
                     if net > 0 and p["meta"].get("conditionId") in hedged_cids:
                         to_remove.append(asset_id)
                         continue
@@ -195,7 +208,7 @@ def main():
                     price = p.get("price")
                     age = now - p["first_seen"]
 
-                    # Carry forward buys that are too small for a $1 order (unless expired)
+                    # Carry forward small buys until they reach $1 or expire
                     if net > 0 and price is not None:
                         our_cost = abs(net) * max_copy_pct * float(price)
                         if our_cost < 1.0 and age < MAX_PENDING:
@@ -204,12 +217,35 @@ def main():
                     synthetic = dict(p["meta"])
                     synthetic["type"] = "buy" if net > 0 else "sell"
                     synthetic["size"] = abs(net)
+
                     if age >= MAX_PENDING and net > 0 and price is not None:
                         our_cost = abs(net) * max_copy_pct * float(price)
                         if our_cost < 1.0:
                             logger.debug(f"Expiring pending: {synthetic.get('title')} (${our_cost:.2f} after {age:.0f}s)")
                             to_remove.append(asset_id)
                             continue
+
+                    # ── Sell validation: require /activity confirmation ────────
+                    # /positions flickering causes false sell signals (~5s dropout).
+                    # Only execute a sell if /activity has recorded an actual on-chain
+                    # transaction. If not confirmed within SELL_CONFIRM_SECONDS, discard.
+                    if net < 0:
+                        confirmed = activity_sells.get(asset_id, 0) > (now - ACTIVITY_WINDOW)
+                        if not confirmed:
+                            if age < SELL_CONFIRM_SECONDS:
+                                logger.info(
+                                    f"Holding sell: awaiting /activity confirmation "
+                                    f"({age:.0f}s/{SELL_CONFIRM_SECONDS}s) — {synthetic.get('title')}"
+                                )
+                                continue
+                            else:
+                                logger.info(
+                                    f"Discarding sell: no /activity confirmation after {age:.0f}s "
+                                    f"(flicker) — {synthetic.get('title')}"
+                                )
+                                to_remove.append(asset_id)
+                                continue
+
                     logger.info(
                         f"Flushing batch: net {synthetic['type']} {synthetic['size']:.2f} shares "
                         f"of {synthetic.get('title')}"
@@ -231,7 +267,7 @@ def main():
                 except Exception as e:
                     logger.error(f"Redemption sweep failed: {e}")
 
-            time.sleep(1) # Check every second (rate limiter handles API constraint)
+            time.sleep(1)
 
     except KeyboardInterrupt:
         logger.info("Stopping...")

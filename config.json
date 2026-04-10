@@ -25,5 +25,6 @@
     "blocked_title_keywords": ["taiwan"],
     "min_trade_usd": 5.0,
     "max_position_usd": 1500.0,
-    "batch_window_seconds": 30
+    "batch_window_seconds": 30,
+    "sell_confirm_seconds": 60
 }
