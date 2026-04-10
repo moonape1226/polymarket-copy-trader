@@ -59,7 +59,7 @@ def send_portfolio_update(proxy_address: str, webhook_url: str) -> bool:
         f"{pnl_emoji} *Polymarket Portfolio Update*\n"
         f"```\n"
         f"Current Value  : ${total_value:>10,.2f}  (cash ${usdc_cash:,.2f})\n"
-        f"Unrealized P&L : {sign}${abs(cash_pnl):>9,.2f}  ({sign}{pnl_pct:.1f}%)\n"
+        f"Unrealized P&L : {sign}${abs(cash_pnl):>9,.2f}  ({sign}{abs(pnl_pct):.1f}%)\n"
         f"Realized P&L   : ${realized_pnl:>+10,.2f}\n"
         f"Open Positions : {len(active)}\n"
         f"Redeemable     : {len(redeemable)}\n"

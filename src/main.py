@@ -48,6 +48,10 @@ def main():
     # false-new-position baseline on the first successful poll (fix #1).
     logger.info(f"Initializing state for {len(wallets)} wallets...")
     wallet_states = {wallet: [] for wallet in wallets}
+    # Tracks how many consecutive polls each asset has been absent per wallet.
+    # A position must be missing for 2+ consecutive polls before being treated as a real sell,
+    # filtering single-poll API glitches where positions temporarily disappear.
+    absent_counts: dict = {wallet: {} for wallet in wallets}
     for wallet in wallets:
         positions = fetch_positions_safe(wallet)
         if positions is not None:
@@ -78,7 +82,31 @@ def main():
                         continue
 
                     previous_positions = wallet_states[wallet]
-                    changes = detect_order_changes(previous_positions, current_positions)
+                    curr_map = {p['asset']: p for p in current_positions}
+                    prev_map = {p['asset']: p for p in previous_positions}
+
+                    # Update absent counts: reset for returned assets, increment for missing ones
+                    for asset_id in list(absent_counts[wallet].keys()):
+                        if asset_id in curr_map:
+                            del absent_counts[wallet][asset_id]
+                    for asset_id in prev_map:
+                        if asset_id not in curr_map:
+                            absent_counts[wallet][asset_id] = absent_counts[wallet].get(asset_id, 0) + 1
+
+                    # Build stable view: ghost positions absent for only 1 poll back in,
+                    # so single-poll API dropouts don't generate spurious SELL signals.
+                    stable_current = list(current_positions)
+                    for asset_id, count in absent_counts[wallet].items():
+                        if count < 2 and asset_id in prev_map:
+                            stable_current.append(prev_map[asset_id])
+                            logger.debug(f"Holding ghost position {asset_id[:12]}… (absent {count} poll)")
+
+                    changes = detect_order_changes(previous_positions, stable_current)
+
+                    # Clean up absent counts for assets confirmed sold this cycle
+                    for change in changes:
+                        if change["type"].upper() == "SELL":
+                            absent_counts[wallet].pop(change["asset"], None)
 
                     for change in changes:
                         asset_id    = change["asset"]
@@ -96,7 +124,7 @@ def main():
                             f"(net: {pending[asset_id]['net_size']:+.2f})"
                         )
 
-                    wallet_states[wallet] = current_positions
+                    wallet_states[wallet] = stable_current
 
                 except Exception as e:
                     logger.error(f"Error tracking {wallet}: {e}")
