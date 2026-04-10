@@ -46,7 +46,6 @@ def send_portfolio_update(proxy_address: str, webhook_url: str) -> bool:
     redeemable = [p for p in positions if p.get("redeemable")]
 
     pnl_emoji = "📈" if cash_pnl >= 0 else "📉"
-    sign      = "+" if cash_pnl >= 0 else "-"
 
     # Top 5 positions by current value
     top = sorted(active, key=lambda p: float(p.get("currentValue", 0)), reverse=True)[:5]
@@ -59,7 +58,7 @@ def send_portfolio_update(proxy_address: str, webhook_url: str) -> bool:
         f"{pnl_emoji} *Polymarket Portfolio Update*\n"
         f"```\n"
         f"Current Value  : ${total_value:>10,.2f}  (cash ${usdc_cash:,.2f})\n"
-        f"Unrealized P&L : {sign}${abs(cash_pnl):>9,.2f}  ({sign}{abs(pnl_pct):.1f}%)\n"
+        f"Unrealized P&L : ${cash_pnl:>+10,.2f}  ({pnl_pct:>+.1f}%)\n"
         f"Realized P&L   : ${realized_pnl:>+10,.2f}\n"
         f"Open Positions : {len(active)}\n"
         f"Redeemable     : {len(redeemable)}\n"
