@@ -48,10 +48,11 @@ def main():
     # false-new-position baseline on the first successful poll (fix #1).
     logger.info(f"Initializing state for {len(wallets)} wallets...")
     wallet_states = {wallet: [] for wallet in wallets}
-    # Tracks how many consecutive polls each asset has been absent per wallet.
-    # A position must be missing for 2+ consecutive polls before being treated as a real sell,
-    # filtering single-poll API glitches where positions temporarily disappear.
-    absent_counts: dict = {wallet: {} for wallet in wallets}
+    # Tracks the timestamp when each asset first went absent per wallet.
+    # A position must be missing for SELL_CONFIRM_SECONDS before being treated
+    # as a real sell, filtering API dropouts that typically resolve within ~5s.
+    SELL_CONFIRM_SECONDS = config.get("sell_confirm_seconds", 10)
+    absent_since: dict = {wallet: {} for wallet in wallets}
     for wallet in wallets:
         positions = fetch_positions_safe(wallet)
         if positions is not None:
@@ -84,29 +85,33 @@ def main():
                     previous_positions = wallet_states[wallet]
                     curr_map = {p['asset']: p for p in current_positions}
                     prev_map = {p['asset']: p for p in previous_positions}
+                    now_ts = time.time()
 
-                    # Update absent counts: reset for returned assets, increment for missing ones
-                    for asset_id in list(absent_counts[wallet].keys()):
+                    # Reset timer for positions that returned
+                    for asset_id in list(absent_since[wallet].keys()):
                         if asset_id in curr_map:
-                            del absent_counts[wallet][asset_id]
-                    for asset_id in prev_map:
-                        if asset_id not in curr_map:
-                            absent_counts[wallet][asset_id] = absent_counts[wallet].get(asset_id, 0) + 1
+                            del absent_since[wallet][asset_id]
 
-                    # Build stable view: ghost positions absent for only 1 poll back in,
-                    # so single-poll API dropouts don't generate spurious SELL signals.
+                    # Record first-seen timestamp for newly absent positions
+                    for asset_id in prev_map:
+                        if asset_id not in curr_map and asset_id not in absent_since[wallet]:
+                            absent_since[wallet][asset_id] = now_ts
+
+                    # Build stable view: ghost back positions absent less than SELL_CONFIRM_SECONDS.
+                    # Polymarket /positions API has ~5s dropouts; 10s threshold filters them
+                    # without meaningfully delaying real sell detection.
                     stable_current = list(current_positions)
-                    for asset_id, count in absent_counts[wallet].items():
-                        if count < 2 and asset_id in prev_map:
+                    for asset_id, first_absent in absent_since[wallet].items():
+                        if now_ts - first_absent < SELL_CONFIRM_SECONDS and asset_id in prev_map:
                             stable_current.append(prev_map[asset_id])
-                            logger.debug(f"Holding ghost position {asset_id[:12]}… (absent {count} poll)")
+                            logger.info(f"Holding ghost position {asset_id[:12]}… (absent {now_ts - first_absent:.1f}s)")
 
                     changes = detect_order_changes(previous_positions, stable_current)
 
-                    # Clean up absent counts for assets confirmed sold this cycle
+                    # Clean up timer for confirmed sells
                     for change in changes:
                         if change["type"].upper() == "SELL":
-                            absent_counts[wallet].pop(change["asset"], None)
+                            absent_since[wallet].pop(change["asset"], None)
 
                     for change in changes:
                         asset_id    = change["asset"]
