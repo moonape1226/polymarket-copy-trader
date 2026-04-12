@@ -30,7 +30,7 @@ _USDC_ABI = [{"name": "balanceOf", "type": "function",
 
 
 class TradingModule:
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], ws_feed=None):
         private_key = os.getenv("POLYMARKET_PRIVATE_KEY")
         proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
         if not private_key:
@@ -58,6 +58,7 @@ class TradingModule:
         self._exposure_last_refresh: float = 0.0       # timestamp of last exposure refresh
         self._usdc_balance_cached: float = 0.0
         self._usdc_balance_refresh: float = 0.0
+        self._ws_feed = ws_feed
 
         self._credentials = {
             "apiKey": os.getenv("POLYMARKET_API_KEY"),
@@ -106,20 +107,24 @@ class TradingModule:
             writer.writerow(row)
 
     def _create_order(self, market_id: str, outcome_id: str, side: str,
-                      amount: float, fee: int = 1000) -> Dict[str, Any]:
+                      amount: float, fee: int = 1000, order_type: str = "market",
+                      price: Optional[float] = None) -> Dict[str, Any]:
         """Place an order via direct HTTP to the pmxt sidecar."""
         server_info = self._server_manager.get_server_info()
         url = f"http://localhost:{server_info.get('port', 3847)}/api/polymarket/createOrder"
         token = server_info.get("accessToken", "")
+        args = {
+            "marketId": market_id,
+            "outcomeId": outcome_id,
+            "side": side,
+            "type": order_type,
+            "amount": amount,
+            "fee": fee,
+        }
+        if price is not None:
+            args["price"] = price
         body = {
-            "args": [{
-                "marketId": market_id,
-                "outcomeId": outcome_id,
-                "side": side,
-                "type": "market",
-                "amount": amount,
-                "fee": fee,
-            }],
+            "args": [args],
             "credentials": self._credentials,
         }
         resp = http_requests.post(
@@ -136,6 +141,25 @@ class TradingModule:
             err = data.get("error", {})
             raise RuntimeError(f"[{resp.status_code}] {err.get('message', resp.text)}")
         return data["data"]
+
+    def _get_clob_price(self, asset_id: str, side: str = "BUY") -> Optional[float]:
+        """Get current price: WS cache first, REST fallback."""
+        if self._ws_feed:
+            price = self._ws_feed.get_ask(asset_id) if side == "BUY" else self._ws_feed.get_bid(asset_id)
+            if price:
+                return price
+        try:
+            resp = http_requests.get(
+                "https://clob.polymarket.com/price",
+                params={"token_id": asset_id, "side": side},
+                timeout=5,
+            )
+            if resp.ok:
+                price = float(resp.json().get("price", 0))
+                return price if price > 0 else None
+        except Exception as e:
+            logger.debug(f"CLOB price check failed for {asset_id[:12]}: {e}")
+        return None
 
     def _get_market_id(self, slug: str) -> Optional[str]:
         if slug in self._market_cache:
@@ -291,8 +315,33 @@ class TradingModule:
                     )
                     our_size = reduced_size
 
-            cost_str = f" at ${float(price):.4f} (~${our_size * float(price):.2f})" if price is not None else ""
+            # For buys: determine limit price from WS detection or current CLOB
+            buy_limit_price = None
+            if side == 'buy':
+                buy_limit_price = trade_change.get('detection_price') or self._get_clob_price(asset_id, "BUY")
+
+            # Slippage guard: skip if market moved too far from detection price
+            max_slippage = self.config.get("max_slippage_pct")
+            detection_price = trade_change.get('detection_price')
+            if side == 'buy' and max_slippage is not None and detection_price is not None:
+                current_price = self._get_clob_price(asset_id, "BUY")
+                if current_price is not None:
+                    slippage = (current_price - detection_price) / detection_price
+                    if slippage > max_slippage:
+                        logger.info(
+                            f"Skipping buy: slippage {slippage*100:.0f}% "
+                            f"({detection_price:.4f} → {current_price:.4f}), "
+                            f"exceeds {max_slippage*100:.0f}% limit — {slug}"
+                        )
+                        return
+
             rate_str = f" [low_prob {effective_copy_pct*100:.1f}%]" if is_low_prob else f" [{effective_copy_pct*100:.1f}%]"
+            if buy_limit_price:
+                cost_str = f" limit@{buy_limit_price:.4f} (~${our_size * buy_limit_price:.2f})"
+            elif price is not None:
+                cost_str = f" market (~${our_size * float(price):.2f} est.)"
+            else:
+                cost_str = " market"
             logger.info(f"Copying {side} for {slug}: {our_size} shares{cost_str}{rate_str}")
 
             if not self.config.get("trading_enabled", False):
@@ -317,11 +366,23 @@ class TradingModule:
                 outcome_id=asset_id,
                 side=side,
                 amount=our_size,
+                order_type="limit" if buy_limit_price else "market",
+                price=buy_limit_price,
             )
 
-            logger.info(f"Success! Order ID: {order['id']}")
+            # Try to extract actual fill cost from order response
+            fill_cost = None
+            fills = order.get("fills") or []
+            if fills:
+                fill_cost = sum(float(f.get("price", 0)) * float(f.get("size", 0)) for f in fills)
+            logger.debug(f"Order response: {order}")
 
-            our_cost = our_size * float(price) if price is not None else 0.0
+            if fill_cost:
+                logger.info(f"Success! Order {order['id']} — actual fill ${fill_cost:.2f}")
+            else:
+                logger.info(f"Success! Order {order['id']}")
+
+            our_cost = fill_cost if fill_cost else (our_size * float(price) if price is not None else 0.0)
             self._log_bot_trade(side, trade_change, our_size, our_cost,
                                 effective_copy_pct, is_low_prob, order['id'])
 

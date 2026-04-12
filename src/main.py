@@ -12,6 +12,7 @@ from src.positions import get_user_positions, detect_order_changes
 from src.trading import TradingModule
 from src.redeemer import redeem_resolved_positions
 from src.notifier import send_portfolio_update
+from src.ws_feed import WSPriceFeed
 
 load_dotenv()
 
@@ -30,8 +31,8 @@ def load_config():
         return json.load(f)
 
 
-def _fetch_activity_sells(wallet: str) -> list:
-    """Fetch recent SELL trades for a wallet from the Polymarket activity API."""
+def _fetch_recent_activity(wallet: str) -> list:
+    """Fetch recent TRADE records (both BUY and SELL) from the Polymarket activity API."""
     try:
         resp = requests.get(
             "https://data-api.polymarket.com/activity",
@@ -39,10 +40,7 @@ def _fetch_activity_sells(wallet: str) -> list:
             timeout=10,
         )
         resp.raise_for_status()
-        return [
-            r for r in resp.json()
-            if r.get("type") == "TRADE" and r.get("side", "").upper() == "SELL"
-        ]
+        return [r for r in resp.json() if r.get("type") == "TRADE"]
     except Exception as e:
         logger.warning(f"Activity fetch failed for {wallet[:8]}…: {e}")
         return []
@@ -57,7 +55,19 @@ def main():
         logger.error("No wallets to track in config.")
         return
 
-    trading_module = TradingModule(config)
+    ws_feed = WSPriceFeed()
+    initial_assets = []
+    for wallet in wallets:
+        positions = get_user_positions(wallet)
+        if positions:
+            for p in positions:
+                aid = p.get("asset", "")
+                if aid and float(p.get("size", 0)) > 0:
+                    initial_assets.append(aid)
+    ws_feed.start(initial_assets)
+    logger.info(f"WS price feed started with {len(initial_assets)} assets")
+
+    trading_module = TradingModule(config, ws_feed=ws_feed)
 
     @sleep_and_retry
     @limits(calls=rate_limit, period=10)
@@ -81,22 +91,22 @@ def main():
 
     BATCH_WINDOW = config.get("batch_window_seconds", 180)
     MAX_PENDING  = config.get("max_pending_seconds", 300)
-    # How long to wait for /activity confirmation before discarding a sell as flicker.
-    # Polymarket activity indexing takes 13–42s empirically; 60s gives comfortable margin.
-    SELL_CONFIRM_SECONDS = config.get("sell_confirm_seconds", 60)
-    # Poll /activity every N seconds to validate pending sells.
+    # How long to wait for /activity confirmation before discarding as flicker.
+    # 13–42s empirically; 60s gives comfortable margin.
+    TRADE_CONFIRM_SECONDS = config.get("trade_confirm_seconds",
+                                       config.get("sell_confirm_seconds", 60))
     ACTIVITY_POLL_INTERVAL = config.get("activity_poll_interval", 10)
-    # Look back this far in activity timestamps when confirming a sell.
     ACTIVITY_WINDOW = 300
+    WS_LOOKBACK = 15
 
-    # activity_sells: asset_id → most recent on-chain sell timestamp (Unix seconds)
-    # Populated by polling /activity; used to validate pending SELL signals from /positions.
+    activity_buys: dict = {}
     activity_sells: dict = {}
     last_activity_poll: float = 0.0
 
     logger.info(
         f"Starting copy trader loop (batch window: {BATCH_WINDOW}s, "
-        f"sell confirm: {SELL_CONFIRM_SECONDS}s, activity poll: {ACTIVITY_POLL_INTERVAL}s)..."
+        f"confirm timeout: {TRADE_CONFIRM_SECONDS}s, activity poll: {ACTIVITY_POLL_INTERVAL}s, "
+        f"WS dual-signal: enabled)..."
     )
     poll_cycle    = 0
     last_notify_slot = -1
@@ -120,7 +130,12 @@ def main():
                         signed_size = size if change["type"].lower() == "buy" else -size
 
                         if asset_id not in pending:
-                            pending[asset_id] = {"net_size": 0.0, "price": change.get("price"), "meta": change, "first_seen": time.time()}
+                            pending[asset_id] = {
+                                "net_size": 0.0, "price": change.get("price"), "meta": change,
+                                "first_seen": time.time(), "ws_known": ws_feed.is_subscribed(asset_id),
+                                "detection_price": ws_feed.get_ask(asset_id),
+                            }
+                            ws_feed.subscribe([asset_id])
                         pending[asset_id]["net_size"] += signed_size
                         pending[asset_id]["price"]     = change.get("price")
                         pending[asset_id]["meta"]      = change
@@ -137,22 +152,81 @@ def main():
 
             now = time.time()
 
-            # ── Poll /activity to validate pending sells ─────────────────────
+            # ── WS dual-signal: fast confirmation for WS-subscribed assets ──
+            for asset_id in list(pending.keys()):
+                p = pending[asset_id]
+                if not p.get("ws_known"):
+                    continue
+                if not ws_feed.has_recent_trade(asset_id, p["first_seen"] - WS_LOOKBACK):
+                    continue
+                net = p["net_size"]
+                if abs(net) < 0.01:
+                    continue
+                if net < -0.01:
+                    synthetic = dict(p["meta"])
+                    synthetic["type"] = "sell"
+                    synthetic["size"] = abs(net)
+                    synthetic["detection_price"] = p.get("detection_price")
+                    logger.info(
+                        f"WS confirmed sell: {abs(net):.2f} shares "
+                        f"of {synthetic.get('title')}"
+                    )
+                    trading_module.execute_copy_trade(synthetic)
+                    pending.pop(asset_id, None)
+                elif not p.get("ws_confirmed"):
+                    p["ws_confirmed"] = True
+                    logger.info(
+                        f"WS confirmed buy-add: {net:.2f} shares "
+                        f"of {p['meta'].get('title')} (deferred to batch flush)"
+                    )
+
+            # ── Poll /activity to validate pending trades ────────────────────
             if now - last_activity_poll >= ACTIVITY_POLL_INTERVAL:
                 for wallet in wallets:
-                    for r in _fetch_activity_sells(wallet):
+                    for r in _fetch_recent_activity(wallet):
                         asset_id = r.get("asset", "")
                         ts = int(r.get("timestamp", 0))
+                        side = r.get("side", "").upper()
                         if asset_id and ts:
-                            activity_sells[asset_id] = max(activity_sells.get(asset_id, 0), ts)
-                # Prune entries older than ACTIVITY_WINDOW
+                            if side == "BUY":
+                                activity_buys[asset_id] = max(activity_buys.get(asset_id, 0), ts)
+                            elif side == "SELL":
+                                activity_sells[asset_id] = max(activity_sells.get(asset_id, 0), ts)
                 cutoff = now - ACTIVITY_WINDOW
+                activity_buys = {k: v for k, v in activity_buys.items() if v > cutoff}
                 activity_sells = {k: v for k, v in activity_sells.items() if v > cutoff}
                 last_activity_poll = now
 
-            # ── Slack portfolio summary every 30 minutes ─────────────────────
+                # Immediately flush confirmed pending trades
+                for asset_id in list(pending.keys()):
+                    p = pending[asset_id]
+                    net = p["net_size"]
+                    if net > 0.01 and activity_buys.get(asset_id, 0) > (now - ACTIVITY_WINDOW):
+                        synthetic = dict(p["meta"])
+                        synthetic["type"] = "buy"
+                        synthetic["size"] = abs(net)
+                        synthetic["detection_price"] = p.get("detection_price")
+                        logger.info(
+                            f"Flushing confirmed buy: {abs(net):.2f} shares "
+                            f"of {synthetic.get('title')}"
+                        )
+                        trading_module.execute_copy_trade(synthetic)
+                        pending.pop(asset_id, None)
+                    elif net < -0.01 and activity_sells.get(asset_id, 0) > (now - ACTIVITY_WINDOW):
+                        synthetic = dict(p["meta"])
+                        synthetic["type"] = "sell"
+                        synthetic["size"] = abs(net)
+                        synthetic["detection_price"] = p.get("detection_price")
+                        logger.info(
+                            f"Flushing confirmed sell: {abs(net):.2f} shares "
+                            f"of {synthetic.get('title')}"
+                        )
+                        trading_module.execute_copy_trade(synthetic)
+                        pending.pop(asset_id, None)
+
+            # ── Slack portfolio summary every hour ───────────────────────────
             _dt = datetime.datetime.now()
-            current_slot = _dt.hour * 2 + (1 if _dt.minute >= 30 else 0)
+            current_slot = _dt.hour
             if slack_webhook and current_slot != last_notify_slot:
                 last_notify_slot = current_slot
                 try:
@@ -217,6 +291,7 @@ def main():
                     synthetic = dict(p["meta"])
                     synthetic["type"] = "buy" if net > 0 else "sell"
                     synthetic["size"] = abs(net)
+                    synthetic["detection_price"] = p.get("detection_price")
 
                     if age >= MAX_PENDING and net > 0 and price is not None:
                         our_cost = abs(net) * max_copy_pct * float(price)
@@ -225,33 +300,28 @@ def main():
                             to_remove.append(asset_id)
                             continue
 
-                    # ── Sell validation: require /activity confirmation ────────
-                    # /positions flickering causes false sell signals (~5s dropout).
-                    # Only execute a sell if /activity has recorded an actual on-chain
-                    # transaction. If not confirmed within SELL_CONFIRM_SECONDS, discard.
-                    if net < 0:
-                        confirmed = activity_sells.get(asset_id, 0) > (now - ACTIVITY_WINDOW)
-                        if not confirmed:
-                            if age < SELL_CONFIRM_SECONDS:
-                                logger.info(
-                                    f"Holding sell: awaiting /activity confirmation "
-                                    f"({age:.0f}s/{SELL_CONFIRM_SECONDS}s) — {synthetic.get('title')}"
-                                )
-                                continue
-                            else:
-                                logger.info(
-                                    f"Discarding sell: no /activity confirmation after {age:.0f}s "
-                                    f"(flicker) — {synthetic.get('title')}"
-                                )
-                                to_remove.append(asset_id)
-                                continue
-
-                    logger.info(
-                        f"Flushing batch: net {synthetic['type']} {synthetic['size']:.2f} shares "
-                        f"of {synthetic.get('title')}"
-                    )
-                    trading_module.execute_copy_trade(synthetic)
-                    to_remove.append(asset_id)
+                    if p.get("ws_confirmed"):
+                        logger.info(
+                            f"Flushing WS-confirmed buy: {abs(net):.2f} shares "
+                            f"of {synthetic.get('title')}"
+                        )
+                        trading_module.execute_copy_trade(synthetic)
+                        to_remove.append(asset_id)
+                    elif age < TRADE_CONFIRM_SECONDS:
+                        direction = "sell" if net < 0 else "buy"
+                        logger.info(
+                            f"Holding {direction}: awaiting confirmation "
+                            f"({age:.0f}s/{TRADE_CONFIRM_SECONDS}s) — {synthetic.get('title')}"
+                        )
+                        continue
+                    else:
+                        direction = "sell" if net < 0 else "buy"
+                        logger.info(
+                            f"Discarding {direction}: no confirmation after {age:.0f}s "
+                            f"(flicker) — {synthetic.get('title')}"
+                        )
+                        to_remove.append(asset_id)
+                        continue
 
                 for aid in to_remove:
                     pending.pop(aid, None)
