@@ -103,8 +103,14 @@ def detect_order_changes(
             order = {'asset': asset, **_position_metadata(p_tn_plus_1)}
 
             if size_diff > 0:
-                # Buy Order: Calculate effective price from average price changes
-                exec_price = (size_curr * float(p_tn_plus_1['avgPrice']) - size_prev * float(p_tn['avgPrice'])) / size_diff
+                # Buy Order: Calculate effective price from average price changes.
+                # Data-api may return inconsistent (size updated, avgPrice stale):
+                # in that case the formula collapses to old avgPrice and is unreliable.
+                # Signal unknown (None) so the caller falls back to detection_price / WS ask.
+                if abs(float(p_tn_plus_1['avgPrice']) - float(p_tn['avgPrice'])) < 1e-6:
+                    exec_price = None
+                else:
+                    exec_price = (size_curr * float(p_tn_plus_1['avgPrice']) - size_prev * float(p_tn['avgPrice'])) / size_diff
                 order.update({'type': 'BUY', 'size': size_diff, 'price': exec_price})
             else:
                 # Sell Order: Calculate effective price from realized PnL changes

@@ -42,15 +42,18 @@ class WSPriceFeed:
         loop.run_until_complete(self._ws_loop())
 
     async def _ws_loop(self):
+        backoff = 5
         while True:
             try:
                 async with websockets.connect(WS_URL, ping_interval=None) as ws:
+                    backoff = 5
+
                     with self._sub_lock:
-                        initial = list(self._pending_subs)
+                        resub = list(self._subscribed | set(self._pending_subs))
                         self._pending_subs.clear()
-                    if initial:
-                        await self._send_subscribe(ws, initial)
-                        self._subscribed.update(initial)
+                    if resub:
+                        await self._send_subscribe(ws, resub)
+                        self._subscribed.update(resub)
 
                     ping_task = asyncio.create_task(self._ping_loop(ws))
                     sub_task = asyncio.create_task(self._sub_checker(ws))
@@ -64,8 +67,9 @@ class WSPriceFeed:
                         ping_task.cancel()
                         sub_task.cancel()
             except Exception as e:
-                logger.warning(f"WS feed disconnected: {e}, reconnecting in 5s")
-                await asyncio.sleep(5)
+                logger.warning(f"WS feed disconnected: {e}, reconnecting in {backoff}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
     async def _send_subscribe(self, ws, asset_ids):
         msg = json.dumps({

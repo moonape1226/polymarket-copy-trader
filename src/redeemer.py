@@ -29,6 +29,8 @@ USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84
 ZERO_BYTES32   = b"\x00" * 32
 ZERO_ADDRESS   = "0x0000000000000000000000000000000000000000"
 
+_zero_balance_cache: set = set()
+
 # ── Minimal ABIs ───────────────────────────────────────────────────────────────
 CTF_ABI = [
     {
@@ -150,6 +152,11 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
     if not positions:
         return 0
 
+    positions = [p for p in positions
+                 if (p['conditionId'], p.get('outcomeIndex', 0)) not in _zero_balance_cache]
+    if not positions:
+        return 0
+
     logger.info(f"Found {len(positions)} redeemable position(s)")
     gas_price = w3.eth.gas_price
     redeemed = 0
@@ -172,6 +179,7 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
             pos_id = int.from_bytes(keccak(bytes.fromhex(USDC_ADDRESS[2:]) + collection_id), "big")
             balance = ctf.functions.balanceOf(proxy, pos_id).call()
             if balance == 0:
+                _zero_balance_cache.add((condition_id, outcome_index))
                 logger.info(f"Skipping {title}: already redeemed (balance=0 on-chain)")
                 continue
 
