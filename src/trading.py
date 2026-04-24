@@ -65,6 +65,7 @@ class TradingModule:
         # the next ask sits above BS's last fill. 0.08 ≈ $0.03 slippage per share
         # on typical mid-price entries, in exchange for actually entering the trade.
         self.buy_limit_slip_pct = float(config.get("buy_limit_slip_pct", 0.0))
+        self.buy_limit_slip_pct_low_prob = float(config.get("buy_limit_slip_pct_low_prob", self.buy_limit_slip_pct))
         self.unknown_price_max_ask = float(config.get("unknown_price_max_ask", 0.15))
         self.gtc_order_ttl = float(config.get("gtc_order_ttl_minutes", 120)) * 60
         self._proxy_address = proxy_address
@@ -616,12 +617,14 @@ class TradingModule:
                             f"(no market-order sweep)"
                         )
                         limit_price = capped
-                if limit_price and self.buy_limit_slip_pct > 0:
-                    slipped = round(float(limit_price) * (1 + self.buy_limit_slip_pct), 4)
+                slip_pct = self.buy_limit_slip_pct_low_prob if is_low_prob else self.buy_limit_slip_pct
+                if limit_price and slip_pct > 0:
+                    slipped = round(float(limit_price) * (1 + slip_pct), 4)
                     if slipped != limit_price:
+                        tag = " low_prob" if is_low_prob else ""
                         logger.info(
                             f"Limit slip {limit_price:.4f}→{slipped:.4f} "
-                            f"(+{self.buy_limit_slip_pct*100:.1f}%)"
+                            f"(+{slip_pct*100:.1f}%{tag})"
                         )
                         limit_price = slipped
                 if limit_price and bs_price and float(bs_price) > 0 and self.entry_price_multiplier > 0:
