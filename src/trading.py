@@ -338,8 +338,6 @@ class TradingModule:
                         self._pending_order_meta.pop(asset_id, None)
                         self._pending_order_shares.pop(asset_id, None)
                         self._pending_order_cost.pop(asset_id, None)
-                        self._asset_copy_rate.pop(asset_id, None)
-                        self._asset_is_low_prob.pop(asset_id, None)
 
             logger.debug(f"Refreshed exposure: {len(new_exposure)} positions, low_prob ${new_low_prob_exposure:.2f}")
         except Exception as e:
@@ -684,8 +682,6 @@ class TradingModule:
                             self._pending_order_shares.pop(asset_id, None)
                             self._pending_order_cost.pop(asset_id, None)
                             self._pending_order_meta.pop(asset_id, None)
-                            self._asset_copy_rate.pop(asset_id, None)
-                            self._asset_is_low_prob.pop(asset_id, None)
                         except Exception as e:
                             logger.warning(f"Failed to cancel pending order {pending_oid[:16]}: {e}")
                     else:
