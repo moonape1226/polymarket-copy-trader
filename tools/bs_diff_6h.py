@@ -121,6 +121,8 @@ def check(hours: int, cfg: dict, bs_addr: str, our_addr: str) -> dict:
 
     copy_pct = float(cfg.get("copy_percentage", 1.0))
     slip = float(cfg.get("buy_limit_slip_pct", 0.0))
+    slip_low_prob = float(cfg.get("buy_limit_slip_pct_low_prob", slip))
+    low_prob_threshold = float(cfg.get("low_prob_price_threshold", 0.0))
 
     anomalies: list[dict] = []
     all_assets = set(bs_agg) | set(our_agg) | set(bs_pmap) | set(our_pmap)
@@ -168,10 +170,11 @@ def check(hours: int, cfg: dict, bs_addr: str, our_addr: str) -> dict:
             our_avg = our_t["buy_usd"] / our_t["buy_sh"]
             if bs_avg > 0:
                 excess = our_avg / bs_avg - 1.0
-                if excess > slip + 0.05:
+                effective_slip = slip_low_prob if bs_avg < low_prob_threshold else slip
+                if excess > effective_slip + 0.05:
                     anomalies.append({
                         "kind": "slippage", "aid": aid, "title": title,
-                        "detail": f"BS avg ${bs_avg:.4f} vs ours ${our_avg:.4f} (+{excess*100:.1f}%, slip cfg {slip*100:.0f}%)",
+                        "detail": f"BS avg ${bs_avg:.4f} vs ours ${our_avg:.4f} (+{excess*100:.1f}%, slip cfg {effective_slip*100:.0f}%)",
                     })
 
         # 5. Position divergence (end-of-window). Only flag if BS holds meaningful
