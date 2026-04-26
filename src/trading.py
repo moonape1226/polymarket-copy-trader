@@ -643,12 +643,6 @@ class TradingModule:
                             f"(${our_size * limit_price:.2f} → ${self.low_prob_max_order_usd:.2f} cap)"
                         )
                         our_size = round(max_shares, 2)
-            else:
-                current_bid = self._get_clob_price(asset_id, "SELL")
-                if current_bid is not None and current_bid < 0.005:
-                    logger.info(f"Skipping sell: bid too low (${current_bid:.4f}) — {slug}")
-                    return
-
             rate_str = f" [low_prob {effective_copy_pct*100:.1f}%]" if is_low_prob else f" [{effective_copy_pct*100:.1f}%]"
             if limit_price:
                 cost_str = f" limit@{limit_price:.4f} (~${our_size * limit_price:.2f})"
