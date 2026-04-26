@@ -136,6 +136,13 @@ class TradingModule:
         except Exception as e:
             logger.warning(f"Failed to seed from bot_trades.csv: {e}")
 
+    def _clear_pending(self, asset_id: str) -> None:
+        self._pending_order_ids.pop(asset_id, None)
+        self._pending_order_times.pop(asset_id, None)
+        self._pending_order_meta.pop(asset_id, None)
+        self._pending_order_shares.pop(asset_id, None)
+        self._pending_order_cost.pop(asset_id, None)
+
     def _log_gtc_cancelled(self, asset_id: str, placed_at: float, reason: str):
         meta = self._pending_order_meta.get(asset_id, {})
         row = {
@@ -309,10 +316,7 @@ class TradingModule:
             # Clear pending orders for assets we now actually hold
             for asset_id in list(self._pending_order_ids):
                 if asset_id in new_shares:
-                    self._pending_order_ids.pop(asset_id, None)
-                    self._pending_order_times.pop(asset_id, None)
-                    self._pending_order_shares.pop(asset_id, None)
-                    self._pending_order_cost.pop(asset_id, None)
+                    self._clear_pending(asset_id)
 
             # Merge pending-order cost into exposure so max_position cap counts
             # unfilled-but-placed orders. Prevents reconcile/dispatch loops from
@@ -334,11 +338,7 @@ class TradingModule:
                                 logger.warning(f"Failed to cancel stale order: {e}")
                         placed_at = self._pending_order_times[asset_id]
                         self._log_gtc_cancelled(asset_id, placed_at, "ttl_expired")
-                        self._pending_order_ids.pop(asset_id, None)
-                        self._pending_order_times.pop(asset_id, None)
-                        self._pending_order_meta.pop(asset_id, None)
-                        self._pending_order_shares.pop(asset_id, None)
-                        self._pending_order_cost.pop(asset_id, None)
+                        self._clear_pending(asset_id)
 
             logger.debug(f"Refreshed exposure: {len(new_exposure)} positions, low_prob ${new_low_prob_exposure:.2f}")
         except Exception as e:
@@ -674,11 +674,7 @@ class TradingModule:
                         try:
                             self.poly.cancel_order(pending_oid)
                             self._log_gtc_cancelled(asset_id, placed_at, "bs_exit")
-                            self._pending_order_ids.pop(asset_id, None)
-                            self._pending_order_times.pop(asset_id, None)
-                            self._pending_order_shares.pop(asset_id, None)
-                            self._pending_order_cost.pop(asset_id, None)
-                            self._pending_order_meta.pop(asset_id, None)
+                            self._clear_pending(asset_id)
                         except Exception as e:
                             logger.warning(f"Failed to cancel pending order {pending_oid[:16]}: {e}")
                     else:
@@ -745,11 +741,7 @@ class TradingModule:
                     except Exception as e:
                         logger.warning(f"Failed to cancel previous pending {old_id[:16]}: {e}")
                     self._log_gtc_cancelled(asset_id, placed_at, "redispatch")
-                    self._pending_order_ids.pop(asset_id, None)
-                    self._pending_order_times.pop(asset_id, None)
-                    self._pending_order_meta.pop(asset_id, None)
-                    self._pending_order_shares.pop(asset_id, None)
-                    self._pending_order_cost.pop(asset_id, None)
+                    self._clear_pending(asset_id)
 
             order = self._create_order(
                 market_id=market_id,
