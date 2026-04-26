@@ -67,11 +67,13 @@ BACKFILL_MAX_BLOCKS = 2000
 
 # keccak256("OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)")
 ORDER_FILLED_TOPIC = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
+ORDER_FILLED_TOPIC_LC = ORDER_FILLED_TOPIC.lower()
 
 # Polymarket CLOB contracts on Polygon
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 NEG_RISK_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 NEG_RISK_ADAPTER = "0xB768891e3130F6dF18214Ac804d4DB76c2C37730"
+NEG_RISK_ADAPTER_LC = NEG_RISK_ADAPTER.lower()
 EXCHANGES = [CTF_EXCHANGE, NEG_RISK_EXCHANGE]
 
 # Skip logs where the counter-party is one of these — those are the adapter's
@@ -79,7 +81,7 @@ EXCHANGES = [CTF_EXCHANGE, NEG_RISK_EXCHANGE]
 CONTRACT_ADDRS = {
     CTF_EXCHANGE.lower(),
     NEG_RISK_EXCHANGE.lower(),
-    NEG_RISK_ADAPTER.lower(),
+    NEG_RISK_ADAPTER_LC,
 }
 
 
@@ -273,7 +275,7 @@ class ChainFeed:
 
     def _handle_log(self, log: dict, source: str = ""):
         topics = log.get("topics", [])
-        if len(topics) < 4 or topics[0].lower() != ORDER_FILLED_TOPIC.lower():
+        if len(topics) < 4 or topics[0].lower() != ORDER_FILLED_TOPIC_LC:
             return
 
         tx_hash = log.get("transactionHash", "") or ""
@@ -304,9 +306,9 @@ class ChainFeed:
         else:
             return
 
-        # Dedupe Neg Risk mirror: counter being a contract address means this is
-        # the adapter's self-referential log, not an actual fill against a user.
-        if counter in CONTRACT_ADDRS:
+        # Exchange contracts (CTF/Neg Risk) legitimately appear as counter when
+        # BS uses split/convert flows; only the Neg Risk Adapter is a mirror.
+        if counter == NEG_RISK_ADAPTER_LC:
             return
 
         data_hex = log.get("data", "")
