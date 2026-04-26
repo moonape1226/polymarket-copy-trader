@@ -732,6 +732,25 @@ class TradingModule:
                 otype = "limit"
             else:
                 otype = "market"
+
+            # Cancel any prior pending GTC for this asset before re-dispatching;
+            # otherwise reconcile catch-up stacks orders that all fill → over-buy.
+            if side == 'buy' and otype == 'limit':
+                old_id = self._pending_order_ids.get(asset_id)
+                if old_id:
+                    placed_at = self._pending_order_times.get(asset_id, time.time())
+                    try:
+                        self.poly.cancel_order(old_id)
+                        logger.info(f"Cancelled stale pending {old_id[:16]} before re-dispatch — {slug}")
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel previous pending {old_id[:16]}: {e}")
+                    self._log_gtc_cancelled(asset_id, placed_at, "redispatch")
+                    self._pending_order_ids.pop(asset_id, None)
+                    self._pending_order_times.pop(asset_id, None)
+                    self._pending_order_meta.pop(asset_id, None)
+                    self._pending_order_shares.pop(asset_id, None)
+                    self._pending_order_cost.pop(asset_id, None)
+
             order = self._create_order(
                 market_id=market_id,
                 outcome_id=asset_id,
