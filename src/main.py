@@ -134,6 +134,7 @@ def main():
     chain_pending: dict = {}  # (asset, side) → {size, price_wsum, usd_sum, first_ts, last_ts, tx_hashes, wallet}
     CHAIN_QUIESCE = float(config.get("chain_quiesce_seconds", 1.5))
     CHAIN_DEDUP_TTL = 300  # seconds: /positions detection is suppressed this long after chain dispatch
+    BS_SELL_REBUY_COOLOFF = 60  # seconds: upper bound on /positions lag vs chain feed
 
     # Independent metadata cache for chain-path lookups. Does NOT write to
     # wallet_states (which would corrupt polling's diff baseline). Populated
@@ -340,6 +341,16 @@ def main():
                 if aid in pending:
                     continue
                 if (aid, "buy") in recently_dispatched:
+                    continue
+                # Chain feed dispatches SELL ~3-5s after on-chain, but the
+                # /positions snapshot (driving bs_size below) can lag 30s+;
+                # without this guard reconcile re-buys what we just sold.
+                sell_ts = recently_dispatched.get((aid, "sell"))
+                if sell_ts and (now_ts - sell_ts) < BS_SELL_REBUY_COOLOFF:
+                    logger.info(
+                        f"Reconcile skip: BS sold {now_ts - sell_ts:.0f}s ago "
+                        f"— {bs_pos.get('title')}"
+                    )
                     continue
                 last_ts = last_ts_map.get(aid, 0)
                 if not last_ts or (now_ts - last_ts) > RECONCILE_MAX_AGE:
