@@ -47,7 +47,7 @@ Poll loop (1s interval):
 `TradingModule` maintains in-memory exposure tracking (`_asset_exposure`, `_asset_shares`, `_low_prob_exposure`) and refreshes from on-chain positions every 60s. Orders are placed by calling the pmxt Node.js sidecar over localhost HTTP.
 
 ### market-scanner (`scanner/scanner.py`)
-Standalone service. Runs every 6 hours; queries `gamma-api.polymarket.com` for markets with 80–97% probability, ≤45 days to expiry, >$10K volume and liquidity. Posts results to Slack and tracks calibration accuracy in `/data/scan_history.json`.
+Standalone service. Runs every 15 minutes (`SCAN_INTERVAL_MIN`); queries `gamma-api.polymarket.com` for markets with 80–97% probability, ≤7 days to expiry, >$5K volume, >$3K liquidity. Excludes crypto-price, sports, and esports markets (tag-based + title heuristics in `SPORTS_TITLE_PATTERNS`); per event keeps the top 3 markets by liquidity (`MAX_MARKETS_PER_EVENT`) to limit bucket-event correlation. New markets are reported immediately; existing ones only re-report when probability shifts ≥5% (`NOTIFY_PROB_DELTA`). Logs both per-market and per-event calibration (`event_correct_stats`: a bucket event is "correct" only if all its resolved markets resolved correctly). Posts results to Slack and tracks calibration accuracy in `/data/scan_history.json` (30-day retention).
 
 ### trade-logger (`tracker/tracker.py`)
 Standalone service. Polls `data-api.polymarket.com/activity` every 30s for each wallet in `wallets_to_observe` (config key, separate from `wallets_to_track`). Writes per-wallet CSVs to `/data/observe_<name>.csv`.
