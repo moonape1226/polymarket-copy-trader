@@ -48,8 +48,8 @@ _OPEN_SELLS_FIELDS = [
 _VWAP_SKIPPED_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "vwap_skipped.csv")
 _VWAP_SKIPPED_FIELDS = [
     "skipped_at", "asset_id", "condition_id", "title",
-    "bs_size", "bs_avg_price", "our_size", "our_vwap_estimate",
-    "bucket", "bucket_tolerance", "reference_source", "skip_reason",
+    "bs_size", "bs_avg_price", "reference_price", "our_size", "our_vwap_estimate",
+    "bucket", "bucket_tolerance", "reference_source", "skip_reason", "gate_action",
 ]
 _MARKET_CACHE_MAXSIZE = 1000
 _RPC_URL = "https://polygon-bor-rpc.publicnode.com"
@@ -327,21 +327,33 @@ class TradingModule:
             return False
         if trade_change.get('signal_source') == 'reconcile_stale':
             return False
-        raw_bs_avg = trade_change.get('price')
+        upstream_src = trade_change.get('reference_source')
+        raw_price = trade_change.get('price')
         try:
-            has_bs_avg = bool(raw_bs_avg) and float(raw_bs_avg) > 0
+            price_val = float(raw_price) if raw_price not in (None, "") else None
+            if price_val is not None and price_val <= 0:
+                price_val = None
         except (TypeError, ValueError):
-            has_bs_avg = False
-        if has_bs_avg:
-            ref_for_gate = float(raw_bs_avg)
+            price_val = None
+        det = trade_change.get('detection_price')
+        try:
+            det_val = float(det) if det not in (None, "") else None
+            if det_val is not None and det_val <= 0:
+                det_val = None
+        except (TypeError, ValueError):
+            det_val = None
+        if upstream_src in ("bs_avg", "detection_price"):
+            ref_source = upstream_src
+            ref_for_gate = price_val if price_val is not None else det_val
+        elif price_val is not None:
+            ref_for_gate = price_val
             ref_source = "bs_avg"
+        elif det_val is not None:
+            ref_for_gate = det_val
+            ref_source = "detection_price"
         else:
-            det = trade_change.get('detection_price')
-            try:
-                ref_for_gate = float(det) if det and float(det) > 0 else None
-            except (TypeError, ValueError):
-                ref_for_gate = None
-            ref_source = "detection_price" if ref_for_gate else None
+            ref_for_gate = None
+            ref_source = None
         if not ref_for_gate:
             return False
         bucket = self._vwap_bucket_label(ref_for_gate)
@@ -354,19 +366,23 @@ class TradingModule:
             "title": trade_change.get('title', ''),
             "bs_size": original_size,
             "bs_avg_price": ref_for_gate if ref_source == "bs_avg" else "",
+            "reference_price": ref_for_gate,
             "our_size": our_size,
             "our_vwap_estimate": "",
             "bucket": bucket,
             "bucket_tolerance": tol,
             "reference_source": ref_source,
             "skip_reason": "",
+            "gate_action": "",
         }
         if asks is None:
             log_row["skip_reason"] = "no_book"
+            log_row["gate_action"] = "fail_open"
             self._log_vwap_skipped(log_row)
             return False
         if not asks:
             log_row["skip_reason"] = "empty_asks"
+            log_row["gate_action"] = "skipped"
             self._log_vwap_skipped(log_row)
             self._log_copy_decision(trade_change, "SKIPPED_VWAP",
                                     our_size=our_size, our_cost=None)
@@ -375,6 +391,7 @@ class TradingModule:
         result = self._estimate_buy_vwap(asks, our_size)
         if result is None:
             log_row["skip_reason"] = "empty_asks"
+            log_row["gate_action"] = "skipped"
             self._log_vwap_skipped(log_row)
             self._log_copy_decision(trade_change, "SKIPPED_VWAP",
                                     our_size=our_size, our_cost=None)
@@ -383,13 +400,14 @@ class TradingModule:
         vwap, filled, _levels = result
         log_row["our_vwap_estimate"] = round(vwap, 6)
         max_acceptable = ref_for_gate * (1 + tol)
-        shortfall_pct = float(self.config.get("vwap_max_shortfall_pct", 0.05))
+        shortfall_pct = float(self.config.get("vwap_max_shortfall_pct", 0.0))
         if filled < our_size * (1 - shortfall_pct):
             log_row["skip_reason"] = "book_too_thin"
         elif vwap > max_acceptable:
             log_row["skip_reason"] = "vwap_over_tolerance"
         else:
             return False
+        log_row["gate_action"] = "skipped"
         self._log_vwap_skipped(log_row)
         self._log_copy_decision(trade_change, "SKIPPED_VWAP",
                                 our_size=our_size,
