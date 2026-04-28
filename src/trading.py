@@ -114,6 +114,51 @@ class TradingModule:
         )
         self._server_manager = _sm.ServerManager()
         logger.info("Connected.")
+        self._cancel_orphan_open_orders()
+
+    def _cancel_orphan_open_orders(self):
+        # Bot rebuild wipes _pending_order_ids but CLOB retains the orders.
+        # Untracked buys fill against later market moves and add to position
+        # without the bot accounting for them — see Austin 88-89 / NYC 66-67
+        # 04-27 over-buy after 17:16 redeploy. Import buys into tracking so
+        # cancel-old / TTL / reconcile work correctly. Leave sells alone:
+        # reconcile has no missed-SELL path, so cancelling would lose the
+        # sell signal permanently (BS sell event is in the past).
+        try:
+            orders = self.poly.fetch_open_orders()
+        except Exception as e:
+            logger.warning(f"Orphan-cleanup: fetch_open_orders failed: {e}")
+            return
+        if not orders:
+            return
+        imported = 0
+        cancelled_dup = 0
+        sells_left = 0
+        now = time.time()
+        for o in orders:
+            if str(o.side).lower() != 'buy':
+                sells_left += 1
+                continue
+            aid = o.outcome_id
+            if aid in self._pending_order_ids:
+                try:
+                    self.poly.cancel_order(o.id)
+                    cancelled_dup += 1
+                except Exception as e:
+                    logger.warning(f"Orphan-cleanup: cancel duplicate {o.id[:16]} failed: {e}")
+                continue
+            price = float(o.price)
+            size = float(o.size)
+            self._pending_order_ids[aid] = o.id
+            self._pending_order_times[aid] = now
+            self._pending_order_meta[aid] = {"limit_price": price, "title": ""}
+            self._pending_order_shares[aid] = size
+            self._pending_order_cost[aid] = size * price
+            imported += 1
+        logger.info(
+            f"Orphan-cleanup: imported {imported} buys, cancelled {cancelled_dup} duplicates, "
+            f"left {sells_left} sells alone"
+        )
 
     def _seed_from_csv(self):
         """Re-seed _asset_copy_rate and _asset_is_low_prob from bot_trades.csv so we can
@@ -313,9 +358,16 @@ class TradingModule:
             self._asset_shares = new_shares
             self._low_prob_exposure = new_low_prob_exposure
             self._exposure_last_refresh = time.time()
-            # Clear pending orders for assets we now actually hold
+            # Clear pending only when on-chain shares cover the pending order
+            # size. Clearing on any on_chain>0 drops tracking while the limit
+            # is partially filled; the unfilled remainder sits untracked on
+            # book, so the next dispatch's cancel-old step finds no old_id
+            # and stacks a second limit. Repeated reconcile cycles compound
+            # this — see Chicago 56-57°F 04-27 (9718 sh vs BS 3105 sh).
             for asset_id in list(self._pending_order_ids):
-                if asset_id in new_shares:
+                on_chain = new_shares.get(asset_id, 0.0)
+                pending_sh = self._pending_order_shares.get(asset_id, 0.0)
+                if on_chain >= pending_sh - 1e-6:
                     self._clear_pending(asset_id)
 
             # Merge pending-order cost into exposure so max_position cap counts
