@@ -530,6 +530,7 @@ def main():
                         synthetic = dict(p["meta"])
                         synthetic["type"] = "buy"
                         synthetic["size"] = abs(net)
+                        synthetic["price"] = target_price
                         synthetic["detection_price"] = target_price or p.get("detection_price")
                         logger.info(
                             f"Flushing confirmed buy: {abs(net):.2f} shares "
