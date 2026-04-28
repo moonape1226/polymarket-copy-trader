@@ -284,13 +284,61 @@ def main():
             if meta.get("title"):
                 asset_metadata_cache[b["asset"]] = meta
 
+        chain_meta: dict = {}
+        by_condition: dict = {}
+        for k in ready_keys:
+            b = chain_pending.get(k)
+            if b is None:
+                continue
+            meta = _metadata_from_states(b["asset"])
+            if not meta.get("title"):
+                continue
+            chain_meta[k] = meta
+            outcome = (meta.get("outcome") or "").lower()
+            cid = meta.get("conditionId")
+            if not cid or outcome not in ("yes", "no"):
+                continue
+            shares = b["shares"]
+            avg_price = b["usd"] / shares if shares else 0.0
+            by_condition.setdefault(cid, {}).setdefault(b["side"], {})[outcome] = {
+                "key": k, "price": avg_price, "size": shares, "title": meta.get("title"),
+            }
+
+        skip_chain_keys: set = set()
+        for cid, sides in by_condition.items():
+            for side, outcomes in sides.items():
+                if "yes" not in outcomes or "no" not in outcomes:
+                    continue
+                yes, no = outcomes["yes"], outcomes["no"]
+                size_ratio = abs(yes["size"] - no["size"]) / max(yes["size"], no["size"])
+                if side == "buy":
+                    is_skip = (
+                        abs(yes["price"] - 0.5) <= 0.05 and
+                        abs(no["price"] - 0.5) <= 0.05 and
+                        size_ratio <= 0.01
+                    )
+                    label = "split"
+                else:
+                    is_skip = size_ratio <= 0.01
+                    label = "merge"
+                if is_skip:
+                    logger.info(
+                        f"Chain skip {label}: equal YES/NO {side}s "
+                        f"({yes['size']:.2f} / {no['size']:.2f}) for {yes.get('title') or cid[:12]+'…'}"
+                    )
+                    skip_chain_keys.update([yes["key"], no["key"]])
+
         for key in ready_keys:
             b = chain_pending.get(key)
             if b is None:
                 continue
+            if key in skip_chain_keys:
+                chain_pending.pop(key, None)
+                pending.pop(b["asset"], None)
+                continue
             shares = b["shares"]
             avg_price = b["usd"] / shares if shares else 0.0
-            meta = _metadata_from_states(b["asset"])
+            meta = chain_meta.get(key) or _metadata_from_states(b["asset"])
             if not meta.get("title"):
                 # Still no metadata after sync fetch — data-api likely hasn't
                 # indexed yet. Skip; polling will pick it up within ~1s.
