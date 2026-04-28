@@ -113,6 +113,7 @@ def main():
 
     BATCH_WINDOW = config.get("batch_window_seconds", 180)
     MAX_PENDING  = config.get("max_pending_seconds", 300)
+    WS_FAST_LANE_GRACE = float(config.get("ws_fast_lane_grace_seconds", 2.0))
     # How long to wait for /activity confirmation before discarding as flicker.
     # 13–42s empirically; 60s gives comfortable margin.
     TRADE_CONFIRM_SECONDS = config.get("trade_confirm_seconds",
@@ -829,8 +830,73 @@ def main():
                     p["ws_confirmed_at"] = now
                     logger.info(
                         f"WS confirmed buy-add: {net:.2f} shares "
-                        f"of {p['meta'].get('title')} (deferred to batch flush)"
+                        f"of {p['meta'].get('title')} (fast-lane in {WS_FAST_LANE_GRACE:.1f}s)"
                     )
+
+            # ── WS fast-lane: dispatch ws_confirmed buys after a short grace
+            # instead of waiting for BATCH_WINDOW. Re-runs the same split
+            # detection as the batch flush so a YES+NO split at ~$0.50 still
+            # gets skipped before fast-lane can fire on either side.
+            if WS_FAST_LANE_GRACE > 0:
+                FL_PRICE_TOL = 0.05
+                FL_SIZE_TOL = 0.01
+                cid_buy_info: dict = {}
+                for aid, p in pending.items():
+                    if p.get("net_size", 0) > 0:
+                        cid = p["meta"].get("conditionId")
+                        outcome = (p["meta"].get("outcome") or "").lower()
+                        price = p.get("price")
+                        if cid and outcome in ("yes", "no") and price is not None:
+                            cid_buy_info.setdefault(cid, {})[outcome] = {
+                                "price": float(price), "size": p["net_size"],
+                            }
+                hedged_fast_cids: set = set()
+                for cid, sides in cid_buy_info.items():
+                    if "yes" in sides and "no" in sides:
+                        yes_p, no_p = sides["yes"]["price"], sides["no"]["price"]
+                        yes_s, no_s = sides["yes"]["size"], sides["no"]["size"]
+                        size_ratio = abs(yes_s - no_s) / max(yes_s, no_s)
+                        if (abs(yes_p - 0.5) <= FL_PRICE_TOL
+                                and abs(no_p - 0.5) <= FL_PRICE_TOL
+                                and size_ratio <= FL_SIZE_TOL):
+                            hedged_fast_cids.add(cid)
+
+                for asset_id in list(pending.keys()):
+                    p = pending[asset_id]
+                    if not p.get("ws_confirmed"):
+                        continue
+                    confirmed_at = p.get("ws_confirmed_at", 0)
+                    if now - confirmed_at < WS_FAST_LANE_GRACE:
+                        continue
+                    net = p["net_size"]
+                    if net <= 0.01:
+                        continue
+                    cid = p["meta"].get("conditionId")
+                    if cid and cid in hedged_fast_cids:
+                        logger.info(
+                            f"WS fast-lane skip split: {p['meta'].get('title')} "
+                            f"({cid[:12]}…)"
+                        )
+                        pending.pop(asset_id, None)
+                        continue
+                    synthetic = dict(p["meta"])
+                    synthetic["type"] = "buy"
+                    synthetic["size"] = abs(net)
+                    synthetic["price"] = p.get("price")
+                    synthetic["detection_price"] = p.get("detection_price")
+                    synthetic["signal_source"] = "ws_fast_lane"
+                    synthetic["signal_received_at"] = confirmed_at
+                    synthetic["detected_at"] = p["first_seen"]
+                    logger.info(
+                        f"WS fast-lane buy: {abs(net):.2f} sh of "
+                        f"{synthetic.get('title')} ({(now - confirmed_at):.1f}s after WS confirm)"
+                    )
+                    try:
+                        trading_module.update_bs_cost_basis(synthetic)
+                    except Exception as e:
+                        logger.warning(f"update_bs_cost_basis failed for ws fast-lane: {e}")
+                    _dispatch(synthetic)
+                    pending.pop(asset_id, None)
 
             # ── Poll /activity to validate pending trades ────────────────────
             if now - last_activity_poll >= ACTIVITY_POLL_INTERVAL:
