@@ -141,7 +141,14 @@ def main():
     recently_dispatched: dict = {}  # (asset_id, side) → dispatch ts; per-side so a
                                     # chain BUY doesn't silence polling's SELL detection
                                     # when BS flips the same asset within CHAIN_DEDUP_TTL.
-    RECONCILE_MAX_AGE = 960  # 16 minutes
+    RECONCILE_MAX_AGE = float(config.get("reconcile_max_age_seconds", 960))  # 16 minutes
+    RECONCILE_STALE_SECONDS = float(config.get("reconcile_stale_seconds", 60))
+    RECONCILE_STALE_PRICE_DRIFT_PCT = float(config.get("reconcile_stale_price_drift_pct", 0.05))
+    RECONCILE_STALE_TIGHT_BS_MULT = float(config.get("reconcile_stale_tight_bs_multiplier", 1.02))
+    RECONCILE_STALE_TIGHT_ASK_MULT = float(config.get("reconcile_stale_tight_ask_multiplier", 0.98))
+    RECONCILE_STALE_MAX_NOTIONAL = float(
+        config.get("reconcile_stale_max_notional", float(config.get("min_trade_usd", 0)) * 2)
+    )
 
     # Chain-feed aggregation: collect OrderFilled events per (asset, side) and flush
     # after CHAIN_QUIESCE seconds of no new events. Handles multi-fill orders that
@@ -253,6 +260,13 @@ def main():
             "conditionId": m.get("conditionId"),
             "slug": m.get("slug"),
         }
+
+    def _float_or_none(value):
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return None
+        return f if f > 0 else None
 
     def _drain_chain_events():
         """Pull OrderFilled events from chain_feed, aggregate per (asset, side),
@@ -456,24 +470,91 @@ def main():
                 missed = bs_size - our_on_chain - pending_shares
                 if missed < 1.0:
                     continue
-                # Safety fuse: skip reconcile if current ask is >2x BS avg — stale
-                # catch-up should not chase a runaway market (would trigger Plan B
-                # market-order sweep and fill at top of book; see NYC 54-55 incident).
-                bs_avg = bs_pos.get("avgPrice")
-                cur_ask = ws_feed.get_ask(aid)
-                if bs_avg and cur_ask and float(bs_avg) > 0 and cur_ask > float(bs_avg) * 2:
+                age_s = now_ts - last_ts
+                bs_avg = _float_or_none(bs_pos.get("avgPrice"))
+                cur_ask = _float_or_none(ws_feed.get_ask(aid))
+                ref_price = bs_avg or cur_ask
+                reference_source = "bs_avg" if bs_avg else "detection_price" if cur_ask else "unknown"
+                limit_override = None
+                signal_source = "reconcile"
+                action = "RECONCILE_BACKFILL"
+                skip_limit_slip = False
+
+                if age_s > RECONCILE_STALE_SECONDS:
+                    signal_source = "reconcile_stale"
+                    action = f"RECONCILE_STALE_BACKFILL_{reference_source.upper()}"
+                    if not cur_ask or not ref_price:
+                        logger.info(f"Reconcile stale skip: no current ask — {bs_pos.get('title')}")
+                        trading_module._log_copy_decision(
+                            {
+                                "asset": aid, "type": "buy", "size": missed, "price": ref_price,
+                                "title": bs_pos.get("title"), "outcome": bs_pos.get("outcome"),
+                                "conditionId": bs_pos.get("conditionId"),
+                            },
+                            "SKIPPED_RECONCILE_STALE_NO_ASK",
+                        )
+                        continue
+                    max_allowed = ref_price * (1 + RECONCILE_STALE_PRICE_DRIFT_PCT)
+                    if RECONCILE_STALE_PRICE_DRIFT_PCT > 0 and cur_ask > max_allowed:
+                        logger.info(
+                            f"Reconcile stale skip: ask {cur_ask:.4f} > "
+                            f"{(1 + RECONCILE_STALE_PRICE_DRIFT_PCT):.2f}x {reference_source} {ref_price:.4f} "
+                            f"— {bs_pos.get('title')}"
+                        )
+                        trading_module._log_copy_decision(
+                            {
+                                "asset": aid, "type": "buy", "size": missed, "price": ref_price,
+                                "title": bs_pos.get("title"), "outcome": bs_pos.get("outcome"),
+                                "conditionId": bs_pos.get("conditionId"),
+                            },
+                            f"SKIPPED_RECONCILE_STALE_DRIFT_{reference_source.upper()}",
+                            our_price=cur_ask, our_size=missed,
+                            our_cost=round(missed * cur_ask, 6),
+                        )
+                        continue
+                    tight_candidates = [cur_ask * RECONCILE_STALE_TIGHT_ASK_MULT]
+                    if bs_avg:
+                        tight_candidates.append(bs_avg * RECONCILE_STALE_TIGHT_BS_MULT)
+                    limit_override = round(min(tight_candidates), 4)
+                    if limit_override <= 0:
+                        logger.info(f"Reconcile stale skip: invalid tight limit — {bs_pos.get('title')}")
+                        continue
+                    if RECONCILE_STALE_MAX_NOTIONAL > 0:
+                        capped = round(min(missed, RECONCILE_STALE_MAX_NOTIONAL / limit_override), 2)
+                        if capped * limit_override < 1.0:
+                            logger.info(
+                                f"Reconcile stale skip: capped notional below $1 minimum "
+                                f"(${capped * limit_override:.2f}) — {bs_pos.get('title')}"
+                            )
+                            trading_module._log_copy_decision(
+                                {
+                                    "asset": aid, "type": "buy", "size": missed, "price": ref_price,
+                                    "title": bs_pos.get("title"), "outcome": bs_pos.get("outcome"),
+                                    "conditionId": bs_pos.get("conditionId"),
+                                },
+                                "SKIPPED_RECONCILE_STALE_MIN_ORDER",
+                                our_price=limit_override, our_size=capped,
+                                our_cost=round(capped * limit_override, 6),
+                            )
+                            continue
+                        if capped < missed:
+                            logger.info(
+                                f"Reconcile stale cap: {missed:.2f}→{capped:.2f} shares "
+                                f"(${RECONCILE_STALE_MAX_NOTIONAL:.2f} max) — {bs_pos.get('title')}"
+                            )
+                            missed = capped
+                    skip_limit_slip = True
+                elif bs_avg and cur_ask and cur_ask > bs_avg * 2:
                     logger.info(
-                        f"Reconcile skip: ask {cur_ask:.4f} > 2x BS avg {float(bs_avg):.4f} "
+                        f"Reconcile skip: ask {cur_ask:.4f} > 2x BS avg {bs_avg:.4f} "
                         f"— {bs_pos.get('title')}"
                     )
                     continue
-                # Reconcile ref price: when market has fallen below BS's historical
-                # avg (e.g. BS averaged in at $0.20 but is now buying @ $0.02),
-                # using bs_avg overpays by multiples. Cap at current ask so we
-                # don't chase stale prices while catching up old shortfalls.
-                ref_price = float(bs_avg) if bs_avg else None
-                if cur_ask and cur_ask > 0 and ref_price and ref_price > 0:
-                    ref_price = min(ref_price, float(cur_ask))
+
+                # Fresh reconcile may pay current ask, but stale reconcile uses a
+                # tight opportunistic limit below ask and never applies slip.
+                if cur_ask and ref_price:
+                    ref_price = min(ref_price, cur_ask)
                 synth = {
                     "asset": aid,
                     "type": "buy",
@@ -482,18 +563,26 @@ def main():
                     "title": bs_pos.get("title"),
                     "outcome": bs_pos.get("outcome"),
                     "conditionId": bs_pos.get("conditionId"),
-                    "detection_price": ref_price,
-                    "signal_source": "reconcile",
+                    "detection_price": limit_override or ref_price,
+                    "limit_price_override": limit_override,
+                    "skip_limit_slip": skip_limit_slip,
+                    "reference_source": reference_source,
+                    "signal_source": signal_source,
                     "signal_received_at": last_ts,
                     "detected_at": now_ts,
                 }
-                age_s = now_ts - last_ts
+                limit_note = f", limit={limit_override:.4f}" if limit_override else ""
                 logger.info(
-                    f"Reconcile: catching up missed buy "
+                    f"Reconcile{' stale' if signal_source == 'reconcile_stale' else ''}: catching up missed buy "
                     f"{bs_pos.get('title')} — {missed:.2f} sh "
-                    f"(bs={bs_size:.2f} on_chain={our_on_chain:.2f} pending={pending_shares:.2f}, age {age_s:.0f}s)"
+                    f"(bs={bs_size:.2f} on_chain={our_on_chain:.2f} pending={pending_shares:.2f}, "
+                    f"age {age_s:.0f}s, ref={reference_source}{limit_note})"
                 )
-                trading_module._log_copy_decision(synth, "RECONCILE_BACKFILL")
+                trading_module._log_copy_decision(
+                    synth, action,
+                    our_price=limit_override, our_size=missed,
+                    our_cost=round(missed * limit_override, 6) if limit_override else None,
+                )
                 _dispatch(synth)
 
     try:

@@ -1005,7 +1005,11 @@ class TradingModule:
 
             limit_price = None
             if side == 'buy':
-                limit_price = trade_change.get('detection_price') or self._get_clob_price(asset_id, "BUY")
+                limit_price = trade_change.get('limit_price_override')
+                if limit_price is not None:
+                    limit_price = float(limit_price)
+                else:
+                    limit_price = trade_change.get('detection_price') or self._get_clob_price(asset_id, "BUY")
                 # Gap guard: if ask moved >threshold away from BS's fill price,
                 # cap our limit at (bs_price * threshold) instead of sweeping the book.
                 # Market orders on thin books fill at top of ask stack — see NYC 54-55
@@ -1022,7 +1026,10 @@ class TradingModule:
                             f"(no market-order sweep)"
                         )
                         limit_price = capped
-                slip_pct = self.buy_limit_slip_pct_low_prob if is_low_prob else self.buy_limit_slip_pct
+                if trade_change.get('skip_limit_slip'):
+                    slip_pct = 0.0
+                else:
+                    slip_pct = self.buy_limit_slip_pct_low_prob if is_low_prob else self.buy_limit_slip_pct
                 if limit_price and slip_pct > 0:
                     slipped = round(float(limit_price) * (1 + slip_pct), 4)
                     if slipped != limit_price:
