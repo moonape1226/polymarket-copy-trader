@@ -12,8 +12,9 @@ from src.positions import get_user_positions
 logger = logging.getLogger(__name__)
 
 _RPC_URL     = "https://polygon-bor-rpc.publicnode.com"
-_USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-_USDC_ABI    = [{"name": "balanceOf", "type": "function",
+# pUSD (Polymarket USD) replaced USDC.e as collateral on 2026-04-28.
+_PUSD_ADDRESS = Web3.to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
+_PUSD_ABI    = [{"name": "balanceOf", "type": "function",
                  "inputs": [{"name": "account", "type": "address"}],
                  "outputs": [{"type": "uint256"}], "stateMutability": "view"}]
 
@@ -21,11 +22,11 @@ _USDC_ABI    = [{"name": "balanceOf", "type": "function",
 def _fetch_usdc_balance(proxy_address: str) -> float:
     try:
         w3 = Web3(Web3.HTTPProvider(_RPC_URL))
-        usdc = w3.eth.contract(address=_USDC_ADDRESS, abi=_USDC_ABI)
-        raw = usdc.functions.balanceOf(Web3.to_checksum_address(proxy_address)).call()
-        return raw / 1e6  # USDC has 6 decimals
+        pusd = w3.eth.contract(address=_PUSD_ADDRESS, abi=_PUSD_ABI)
+        raw = pusd.functions.balanceOf(Web3.to_checksum_address(proxy_address)).call()
+        return raw / 1e6  # pUSD has 6 decimals
     except Exception as e:
-        logger.error(f"Failed to fetch USDC balance: {e}")
+        logger.error(f"Failed to fetch pUSD balance: {e}")
         return 0.0
 
 

@@ -56,8 +56,9 @@ _PROCESSED_BUYS_FIELDS = ["timestamp", "asset_id", "tx_hash", "signal_source"]
 _BS_COST_BASIS_JSON = os.path.join(os.path.dirname(__file__), "..", "data", "bs_cost_basis.json")
 _MARKET_CACHE_MAXSIZE = 1000
 _RPC_URL = "https://polygon-bor-rpc.publicnode.com"
-_USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-_USDC_ABI = [{"name": "balanceOf", "type": "function",
+# pUSD (Polymarket USD) replaced USDC.e as collateral on 2026-04-28.
+_PUSD_ADDRESS = Web3.to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
+_PUSD_ABI = [{"name": "balanceOf", "type": "function",
               "inputs": [{"name": "account", "type": "address"}],
               "outputs": [{"type": "uint256"}], "stateMutability": "view"}]
 
@@ -1174,13 +1175,13 @@ class TradingModule:
             return self._usdc_balance_cached
         try:
             w3 = Web3(Web3.HTTPProvider(_RPC_URL))
-            usdc = w3.eth.contract(address=_USDC_ADDRESS, abi=_USDC_ABI)
-            raw = usdc.functions.balanceOf(Web3.to_checksum_address(self._proxy_address)).call()
+            pusd = w3.eth.contract(address=_PUSD_ADDRESS, abi=_PUSD_ABI)
+            raw = pusd.functions.balanceOf(Web3.to_checksum_address(self._proxy_address)).call()
             self._usdc_balance_cached = raw / 1e6
             self._usdc_balance_refresh = time.time()
             return self._usdc_balance_cached
         except Exception as e:
-            logger.error(f"Failed to fetch USDC balance for cap check: {e}")
+            logger.error(f"Failed to fetch pUSD balance for cap check: {e}")
             return float('inf')  # fail open: don't block trades if check fails
 
     def execute_copy_trade(self, trade_change: Dict[str, Any]):
