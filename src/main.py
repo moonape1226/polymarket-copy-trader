@@ -269,6 +269,12 @@ def main():
             return None
         return f if f > 0 else None
 
+    def _activity_tx_key(row: dict, asset_id: str, side: str, ts: int) -> tuple[str, str]:
+        tx_hash = row.get("transactionHash") or row.get("txHash") or row.get("tx_hash") or row.get("hash")
+        if tx_hash:
+            return str(tx_hash), "strong"
+        return f"weak:{asset_id}:{side}:{ts}:{row.get('size', '')}", "weak"
+
     def _drain_chain_events():
         """Pull OrderFilled events from chain_feed, aggregate per (asset, side),
         and flush after CHAIN_QUIESCE seconds of quiet.
@@ -694,9 +700,11 @@ def main():
                             elif side == "SELL":
                                 prev = activity_sells.get(asset_id)
                                 if not prev or ts > prev["ts"]:
+                                    tx_key, key_strength = _activity_tx_key(r, asset_id, side, ts)
                                     activity_sells[asset_id] = {
                                         "ts": ts,
-                                        "tx_hash": r.get("transactionHash") or r.get("txHash") or r.get("hash") or "",
+                                        "tx_hash": tx_key,
+                                        "tx_key_strength": key_strength,
                                     }
                 cutoff = now - ACTIVITY_WINDOW
                 activity_buys = {k: v for k, v in activity_buys.items() if v["ts"] > cutoff}
@@ -742,6 +750,7 @@ def main():
                         synthetic["size"] = abs(net)
                         synthetic["detection_price"] = p.get("detection_price")
                         synthetic["tx_hash"] = sell_info.get("tx_hash", "") if sell_info else ""
+                        synthetic["tx_key_strength"] = sell_info.get("tx_key_strength", "") if sell_info else ""
                         synthetic["signal_source"] = "activity"
                         synthetic["signal_received_at"] = sell_ts
                         synthetic["detected_at"] = p["first_seen"]
