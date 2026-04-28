@@ -188,31 +188,52 @@ def main():
                     return meta
         return {}
 
-    def _sync_refresh_metadata(missing_assets: set, target_wallet: str) -> None:
-        """One-shot sync fetch of BS positions to resolve metadata for newly-opened
-        assets that chain_feed fired on before polling saw them. Writes ONLY to
-        asset_metadata_cache — must not touch wallet_states (would desync polling diff).
-        Skips entries with no title so the skip path still fires.
+    def _fetch_metadata_from_gamma(asset_id: str) -> dict:
+        """Resolve chain-feed asset metadata via gamma-api.
+
+        Gamma indexes markets at creation, so it answers for assets that
+        data-api /positions hasn't picked up yet (BS just opened a new
+        position; data-api lags ~10s). Returns {} on any failure or if the
+        market is closed/archived; caller treats {} as a metadata miss and
+        lets polling handle it.
         """
-        if not missing_assets:
-            return
         try:
-            positions = get_user_positions(target_wallet)
+            resp = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"clob_token_ids": asset_id},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            markets = resp.json()
         except Exception as e:
-            logger.warning(f"Chain metadata sync fetch failed for {target_wallet[:8]}…: {e}")
-            return
-        if not positions:
-            return
-        for p in positions:
-            aid = p.get("asset")
-            title = p.get("title")
-            if aid and aid in missing_assets and title:
-                asset_metadata_cache[aid] = {
-                    "title": title,
-                    "outcome": p.get("outcome"),
-                    "conditionId": p.get("conditionId"),
-                    "slug": p.get("slug"),
-                }
+            logger.warning(f"Gamma metadata fetch failed for {asset_id[:12]}…: {e}")
+            return {}
+        if not markets:
+            return {}
+        m = markets[0]
+        if m.get("closed") or m.get("archived"):
+            return {}
+        title = m.get("question")
+        if not title:
+            return {}
+        tids = m.get("clobTokenIds")
+        outs = m.get("outcomes")
+        try:
+            if isinstance(tids, str): tids = json.loads(tids)
+            if isinstance(outs, str): outs = json.loads(outs)
+        except Exception:
+            tids, outs = None, None
+        outcome = None
+        if isinstance(tids, list) and isinstance(outs, list) and asset_id in tids:
+            idx = tids.index(asset_id)
+            if 0 <= idx < len(outs):
+                outcome = outs[idx]
+        return {
+            "title": title,
+            "outcome": outcome,
+            "conditionId": m.get("conditionId"),
+            "slug": m.get("slug"),
+        }
 
     def _drain_chain_events():
         """Pull OrderFilled events from chain_feed, aggregate per (asset, side),
@@ -250,15 +271,18 @@ def main():
             if chain_pending[k]["shares"] < 1e-6 and now_ts - chain_pending[k]["last_ts"] >= CHAIN_QUIESCE:
                 chain_pending.pop(k, None)
 
-        # Metadata miss resolution: if any ready bucket lacks metadata, do ONE
-        # sync positions fetch per wallet to fill the cache before dispatch.
-        missing_by_wallet: dict = {}
+        # Metadata miss resolution: gamma-api lookup per asset. Gamma indexes
+        # markets at creation so it covers BS-just-opened assets that data-api
+        # /positions hasn't indexed yet (~10s lag). Cache hits skip the call.
         for k in ready_keys:
             b = chain_pending[k]
-            if not _metadata_from_states(b["asset"]).get("title"):
-                missing_by_wallet.setdefault(b["wallet"], set()).add(b["asset"])
-        for wallet, missing_assets in missing_by_wallet.items():
-            _sync_refresh_metadata(missing_assets, wallet)
+            if _metadata_from_states(b["asset"]).get("title"):
+                continue
+            if b["asset"] in asset_metadata_cache:
+                continue
+            meta = _fetch_metadata_from_gamma(b["asset"])
+            if meta.get("title"):
+                asset_metadata_cache[b["asset"]] = meta
 
         for key in ready_keys:
             b = chain_pending.get(key)
