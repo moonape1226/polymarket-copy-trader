@@ -162,12 +162,16 @@ def main():
     # after CHAIN_QUIESCE seconds of no new events. Handles multi-fill orders that
     # emit several OrderFilled logs within the same tx.
     chain_pending: dict = {}  # (asset, side) → {size, price_wsum, usd_sum, first_ts, last_ts, tx_hashes, wallet}
-    # 0.7s aggregates BS multi-fill bursts within a single tx (logs arrive
-    # microseconds apart) and tolerates dust+main fills up to ~500ms apart,
-    # while halving dispatch latency vs the prior 1.5s default. Pending-cost
-    # cap math already counts unfilled orders (trading.py:_refresh_exposure),
-    # so a redispatch under tighter quiesce cannot bypass max_position_usd.
-    CHAIN_QUIESCE = float(config.get("chain_quiesce_seconds", 0.7))
+    # 1.0s aggregates BS multi-fill bursts within a single tx (logs arrive
+    # microseconds apart) and tolerates dust+main fills up to ~800ms apart.
+    # Earlier value 0.7s clipped some multi-fill sequences: when the dust
+    # fill flushed alone, copy filters dropped it (below min_trade_usd), and
+    # the main fill arriving >700ms later was then suppressed by the
+    # _dispatch dedup gate — under-copy. 1.0s keeps most of the latency win
+    # over the original 1.5s default while restoring aggregation margin.
+    # Pending-cost cap math already counts unfilled orders
+    # (trading.py:_refresh_exposure), so flushes can't bypass max_position_usd.
+    CHAIN_QUIESCE = float(config.get("chain_quiesce_seconds", 1.0))
     CHAIN_DEDUP_TTL = 300  # seconds: /positions detection is suppressed this long after chain dispatch
     BS_SELL_REBUY_COOLOFF = 60  # seconds: upper bound on /positions lag vs chain feed
 
