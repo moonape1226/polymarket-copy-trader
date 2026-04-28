@@ -107,6 +107,7 @@ class TradingModule:
         self._pending_sell_ids: Dict[str, str] = {}        # asset_id → unfilled maker sell order_id
         self._pending_sell_times: Dict[str, float] = {}    # asset_id → placement timestamp
         self._pending_sell_meta: Dict[str, dict] = {}      # asset_id → {shares, ttl, bs_price, slug, market_id, is_profit}
+        self._bs_hold_checker = None
         self._ws_feed = ws_feed
         self._csv_lock = threading.Lock()
         self._seed_from_csv()
@@ -225,15 +226,23 @@ class TradingModule:
             return float(buckets.get("0_15_to_0_50", 10))
         return float(buckets.get("gte_0_50", 8))
 
+    def _pending_buy_ttl_seconds(self, asset_id: str) -> float:
+        if asset_id in self._pending_order_entry_ttl:
+            return self._pending_order_entry_ttl[asset_id]
+        meta = self._pending_order_meta.get(asset_id, {})
+        return self._buy_entry_ttl_seconds(meta.get("limit_price"))
+
+    def set_bs_hold_checker(self, checker):
+        self._bs_hold_checker = checker
+
     def _bs_holds_asset(self, asset_id: str) -> str:
-        for wallet in self.config.get("wallets_to_track", []):
-            positions = get_user_positions(wallet)
-            if positions is None:
-                return "unknown"
-            for p in positions:
-                if p.get("asset") == asset_id and float(p.get("size", 0)) > 0:
-                    return "true"
-        return "false"
+        if not self._bs_hold_checker:
+            return "unknown"
+        try:
+            return str(self._bs_hold_checker(asset_id))
+        except Exception as e:
+            logger.warning(f"BS hold check failed for {asset_id[:12]}: {e}")
+            return "unknown"
 
     def _log_gtc_cancelled(self, asset_id: str, placed_at: float, reason: str):
         meta = self._pending_order_meta.get(asset_id, {})
@@ -531,12 +540,12 @@ class TradingModule:
         return market_id
 
     def _cancel_expired_pending_buys(self) -> None:
-        if self.gtc_order_ttl <= 0 or not self._pending_order_times:
+        if not self._pending_order_times:
             return
         now = time.time()
         for asset_id in list(self._pending_order_times):
             placed_at = self._pending_order_times[asset_id]
-            ttl = self._pending_order_entry_ttl.get(asset_id, self.gtc_order_ttl)
+            ttl = self._pending_buy_ttl_seconds(asset_id)
             if now - placed_at <= ttl:
                 continue
             oid = self._pending_order_ids.get(asset_id)
@@ -572,7 +581,7 @@ class TradingModule:
             return
         now = time.time()
         if not any(
-            now - placed_at > self._pending_order_entry_ttl.get(asset_id, self.gtc_order_ttl)
+            now - placed_at > self._pending_buy_ttl_seconds(asset_id)
             for asset_id, placed_at in self._pending_order_times.items()
         ):
             return

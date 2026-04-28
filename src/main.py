@@ -91,6 +91,21 @@ def main():
             wallet_states[wallet] = positions
             logger.info(f"Initialized {wallet[:8]}... with {len(positions)} positions")
 
+    def _bs_holds_from_state(asset_id: str) -> str:
+        saw_uninitialized = False
+        for positions in wallet_states.values():
+            if positions is None:
+                saw_uninitialized = True
+                continue
+            for p in positions:
+                if p.get("asset") == asset_id and float(p.get("size", 0)) > 0:
+                    return "true"
+        if saw_uninitialized:
+            return "unknown"
+        return "false"
+
+    trading_module.set_bs_hold_checker(_bs_holds_from_state)
+
     private_key    = os.getenv("POLYMARKET_PRIVATE_KEY")
     proxy_address  = os.getenv("POLYMARKET_PROXY_ADDRESS")
     slack_webhook  = os.getenv("SLACK_WEBHOOK_URL")
