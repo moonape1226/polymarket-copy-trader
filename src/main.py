@@ -165,6 +165,7 @@ def main():
     # from wallet_states on-demand, and refreshed by a one-shot sync fetch
     # when chain_feed fires on a brand-new asset BS just opened.
     asset_metadata_cache: dict = {}  # asset_id → {title, outcome, conditionId, slug}
+    metadata_inflight: set = set()    # asset_id → in-flight Gamma prefetch
     reconcile_first_asks: dict = {}  # asset_id → {ask, last_ts}; stale unknown-price drift reference
 
     def _get_asset_lock(aid: str) -> threading.Lock:
@@ -281,6 +282,26 @@ def main():
             size = str(row.get("size", ""))
         return f"weak:{asset_id}:{side}:{ts}:{size}", "weak"
 
+    def _prefetch_gamma_metadata(asset_id: str):
+        """Kick off async Gamma fetch the moment a chain bucket is created so
+        flush-time dispatch finds metadata cached. Best-effort: flush still
+        falls back to a sync fetch if the prefetch hasn't completed."""
+        if not asset_id:
+            return
+        if asset_id in asset_metadata_cache or asset_id in metadata_inflight:
+            return
+        if _metadata_from_states(asset_id).get("title"):
+            return
+        metadata_inflight.add(asset_id)
+        def _fetch_and_cache():
+            try:
+                meta = _fetch_metadata_from_gamma(asset_id)
+                if meta.get("title"):
+                    asset_metadata_cache[asset_id] = meta
+            finally:
+                metadata_inflight.discard(asset_id)
+        executor.submit(_fetch_and_cache)
+
     def _drain_chain_events():
         """Pull OrderFilled events from chain_feed, aggregate per (asset, side),
         and flush after CHAIN_QUIESCE seconds of quiet.
@@ -302,6 +323,7 @@ def main():
                     "block": ev["block"],
                 }
                 chain_pending[key] = bucket
+                _prefetch_gamma_metadata(ev["asset"])
             bucket["shares"] += ev["size"]
             bucket["usd"] += ev["size"] * ev["price"]
             bucket["last_ts"] = ev["received_ts"]
