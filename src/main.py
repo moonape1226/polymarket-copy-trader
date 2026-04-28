@@ -701,7 +701,7 @@ def main():
                        and int(r.get("timestamp", 0)) >= cutoff]
 
             # Merge filter: a single tx selling both YES and NO of the same
-            # conditionId collapses to USDC, not a directional exit.
+            # conditionId collapses to collateral (pUSD), not a directional exit.
             merge_assets: set = set()
             by_tx_cid: dict = {}
             for r in records:
@@ -1051,7 +1051,7 @@ def main():
                 to_remove = []
 
                 # Split detection: skip BUY orders where both YES and NO were bought
-                # at ~$0.50 with equal size (1 USDC = 1 YES + 1 NO split operation).
+                # at ~$0.50 with equal size (1 pUSD = 1 YES + 1 NO split operation).
                 SPLIT_PRICE_TOLERANCE = 0.05
                 SPLIT_SIZE_TOLERANCE  = 0.01
                 cid_buy_info: dict = {}

@@ -2,8 +2,8 @@
 Redeems resolved Polymarket positions on-chain via the Gnosis Safe proxy wallet.
 
 When a market resolves:
-  - Winning positions: redeemable for 1 USDC per share
-  - Losing positions: redeemable for 0 USDC (just clears them from the wallet)
+  - Winning positions: redeemable for 1 pUSD per share
+  - Losing positions: redeemable for 0 pUSD (just clears them from the wallet)
 
 Called periodically from main.py to sweep up any settled positions.
 """

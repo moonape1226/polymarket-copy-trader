@@ -101,8 +101,8 @@ class TradingModule:
         self._asset_shares: Dict[str, float] = {}      # asset_id → shares we hold
         self._low_prob_exposure: float = 0.0           # USD currently in low-prob positions
         self._exposure_last_refresh: float = 0.0       # timestamp of last exposure refresh
-        self._usdc_balance_cached: float = 0.0
-        self._usdc_balance_refresh: float = 0.0
+        self._pusd_balance_cached: float = 0.0
+        self._pusd_balance_refresh: float = 0.0
         self._pending_order_ids: Dict[str, str] = {}    # asset_id → unfilled GTC buy order_id
         self._pending_order_times: Dict[str, float] = {}   # asset_id → order placement timestamp
         self._pending_order_meta: Dict[str, dict] = {}     # asset_id → {limit_price, title}
@@ -1170,16 +1170,16 @@ class TradingModule:
                 self._pending_sell_times.pop(aid, None)
                 self._pending_sell_meta.pop(aid, None)
 
-    def _get_usdc_balance(self) -> float:
-        if time.time() - self._usdc_balance_refresh < 60:
-            return self._usdc_balance_cached
+    def _get_pusd_balance(self) -> float:
+        if time.time() - self._pusd_balance_refresh < 60:
+            return self._pusd_balance_cached
         try:
             w3 = Web3(Web3.HTTPProvider(_RPC_URL))
             pusd = w3.eth.contract(address=_PUSD_ADDRESS, abi=_PUSD_ABI)
             raw = pusd.functions.balanceOf(Web3.to_checksum_address(self._proxy_address)).call()
-            self._usdc_balance_cached = raw / 1e6
-            self._usdc_balance_refresh = time.time()
-            return self._usdc_balance_cached
+            self._pusd_balance_cached = raw / 1e6
+            self._pusd_balance_refresh = time.time()
+            return self._pusd_balance_cached
         except Exception as e:
             logger.error(f"Failed to fetch pUSD balance for cap check: {e}")
             return float('inf')  # fail open: don't block trades if check fails
@@ -1306,8 +1306,8 @@ class TradingModule:
             # Portfolio cap: low-prob buys must not exceed X% of total portfolio
             if side == 'buy' and is_low_prob and price is not None:
                 order_cost = our_size * float(price)
-                usdc_balance = self._get_usdc_balance()
-                total_portfolio = usdc_balance + sum(self._asset_exposure.values())
+                pusd_balance = self._get_pusd_balance()
+                total_portfolio = pusd_balance + sum(self._asset_exposure.values())
                 max_low_prob = total_portfolio * self.low_prob_max_portfolio_pct
                 remaining = max(0.0, max_low_prob - self._low_prob_exposure)
                 if remaining < 1.0:

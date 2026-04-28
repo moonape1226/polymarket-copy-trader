@@ -19,7 +19,7 @@ _PUSD_ABI    = [{"name": "balanceOf", "type": "function",
                  "outputs": [{"type": "uint256"}], "stateMutability": "view"}]
 
 
-def _fetch_usdc_balance(proxy_address: str) -> float:
+def _fetch_pusd_balance(proxy_address: str) -> float:
     try:
         w3 = Web3(Web3.HTTPProvider(_RPC_URL))
         pusd = w3.eth.contract(address=_PUSD_ADDRESS, abi=_PUSD_ABI)
@@ -36,8 +36,8 @@ def send_portfolio_update(proxy_address: str, webhook_url: str) -> bool:
     if not positions:
         return False
 
-    usdc_cash      = _fetch_usdc_balance(proxy_address)
-    total_value    = sum(float(p.get("currentValue", 0)) for p in positions) + usdc_cash
+    pusd_cash      = _fetch_pusd_balance(proxy_address)
+    total_value    = sum(float(p.get("currentValue", 0)) for p in positions) + pusd_cash
     total_invested = sum(float(p.get("initialValue", 0)) for p in positions)
     cash_pnl       = sum(float(p.get("cashPnl", 0)) for p in positions)
     realized_pnl   = sum(float(p.get("realizedPnl", 0)) for p in positions)
@@ -58,7 +58,7 @@ def send_portfolio_update(proxy_address: str, webhook_url: str) -> bool:
     text = (
         f"{pnl_emoji} *Polymarket Portfolio Update*\n"
         f"```\n"
-        f"Current Value  : ${total_value:>10,.2f}  (cash ${usdc_cash:,.2f})\n"
+        f"Current Value  : ${total_value:>10,.2f}  (cash ${pusd_cash:,.2f})\n"
         f"Unrealized P&L : ${cash_pnl:>+10,.2f}  ({pnl_pct:>+.1f}%)\n"
         f"Realized P&L   : ${realized_pnl:>+10,.2f}\n"
         f"Open Positions : {len(active)}\n"
