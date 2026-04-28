@@ -13,12 +13,14 @@ Resilience:
   - On reconnect, eth_getLogs backfills blocks since last seen event so a
     brief WS outage does not drop fills permanently.
 
-Event signature:
+Event signature (CTF Exchange V2, post-2026-04-28 cutover):
   OrderFilled(
-    bytes32 orderHash, address maker, address taker,
-    uint256 makerAssetId, uint256 takerAssetId,
-    uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee
+    bytes32 indexed orderHash, address indexed maker, address indexed taker,
+    uint8 side, uint256 tokenId,
+    uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee,
+    bytes32 builder, bytes32 metadata
   )
+  side: 0=BUY (maker pays pUSD, takes shares), 1=SELL (maker gives shares, takes pUSD).
 
 Emitted event shape (on queue):
   {
@@ -65,24 +67,14 @@ DEDUP_TTL = 600  # seconds; mostly for memory hygiene, collisions impossible
 # so 2000 blocks ≈ 67min of outage coverage.
 BACKFILL_MAX_BLOCKS = 2000
 
-# keccak256("OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)")
-ORDER_FILLED_TOPIC = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
+# keccak256("OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)")
+ORDER_FILLED_TOPIC = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
 ORDER_FILLED_TOPIC_LC = ORDER_FILLED_TOPIC.lower()
 
-# Polymarket CLOB contracts on Polygon
-CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-NEG_RISK_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
-NEG_RISK_ADAPTER = "0xB768891e3130F6dF18214Ac804d4DB76c2C37730"
-NEG_RISK_ADAPTER_LC = NEG_RISK_ADAPTER.lower()
+# Polymarket CTF Exchange V2 contracts on Polygon (cutover 2026-04-28 11:00 UTC).
+CTF_EXCHANGE = "0xE111180000d2663C0091e4f400237545B87B996B"
+NEG_RISK_EXCHANGE = "0xe2222d279d744050d28e00520010520000310F59"
 EXCHANGES = [CTF_EXCHANGE, NEG_RISK_EXCHANGE]
-
-# Skip logs where the counter-party is one of these — those are the adapter's
-# mirror events that double-count BS's fills.
-CONTRACT_ADDRS = {
-    CTF_EXCHANGE.lower(),
-    NEG_RISK_EXCHANGE.lower(),
-    NEG_RISK_ADAPTER_LC,
-}
 
 
 def _pad_addr_topic(addr: str) -> str:
@@ -306,43 +298,43 @@ class ChainFeed:
         else:
             return
 
-        # Exchange contracts (CTF/Neg Risk) legitimately appear as counter when
-        # BS uses split/convert flows; only the Neg Risk Adapter is a mirror.
-        if counter == NEG_RISK_ADAPTER_LC:
-            return
-
         data_hex = log.get("data", "")
         if data_hex.startswith("0x"):
             data_hex = data_hex[2:]
-        if len(data_hex) < 64 * 5:
+        if len(data_hex) < 64 * 7:
             return
 
-        maker_asset = int(data_hex[0:64], 16)
-        taker_asset = int(data_hex[64:128], 16)
+        side_enum = int(data_hex[0:64], 16)        # 0=BUY, 1=SELL (Order's signed side)
+        token_id_int = int(data_hex[64:128], 16)
         maker_amt = int(data_hex[128:192], 16)
         taker_amt = int(data_hex[192:256], 16)
+        # data[4]=fee, data[5]=builder, data[6]=metadata — unused here.
 
-        # Determine side and asset id:
-        # - makerAsset=0 means maker offered USDC (maker bought shares)
-        # - takerAsset=0 means taker offered USDC (taker bought shares)
-        if bs_side == "maker":
-            if maker_asset == 0:
-                side, asset_int, shares_raw, usdc_raw = "buy", taker_asset, taker_amt, maker_amt
-            else:
-                side, asset_int, shares_raw, usdc_raw = "sell", maker_asset, maker_amt, taker_amt
-        else:  # taker
-            if taker_asset == 0:
-                side, asset_int, shares_raw, usdc_raw = "buy", maker_asset, maker_amt, taker_amt
-            else:
-                side, asset_int, shares_raw, usdc_raw = "sell", taker_asset, taker_amt, maker_amt
-
-        if shares_raw == 0 or asset_int == 0:
+        if side_enum not in (0, 1) or token_id_int == 0:
             return
 
+        # Order side determines amount semantics:
+        #   BUY  → makerAmt = pUSD paid,    takerAmt = shares received
+        #   SELL → makerAmt = shares given, takerAmt = pUSD received
+        if side_enum == 0:
+            shares_raw, usdc_raw = taker_amt, maker_amt
+        else:
+            shares_raw, usdc_raw = maker_amt, taker_amt
+
+        # Wallet's actual direction:
+        #   maker + BUY  → wallet bought
+        #   maker + SELL → wallet sold
+        #   taker + BUY  → wallet sold (it provided shares to the buyer)
+        #   taker + SELL → wallet bought (it provided pUSD to the seller)
+        wallet_buys = (bs_side == "maker") == (side_enum == 0)
+        side = "buy" if wallet_buys else "sell"
+
+        if shares_raw == 0:
+            return
         shares = shares_raw / 1e6
         usdc = usdc_raw / 1e6
         price = usdc / shares if shares else 0.0
-        asset_id = str(asset_int)
+        asset_id = str(token_id_int)
 
         event = {
             "wallet": wallet,
