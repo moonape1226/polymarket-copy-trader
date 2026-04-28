@@ -525,6 +525,9 @@ def main():
                     # it's from an earlier buy on the same asset — don't use its price.
                     if buy_info and (p["first_seen"] - buy_info["ts"]) > 60:
                         buy_info = None
+                    sell_ts = activity_sells.get(asset_id)
+                    if sell_ts and (p["first_seen"] - sell_ts) > 60:
+                        sell_ts = None
                     if net > 0.01 and buy_info:
                         target_price = buy_info["price"]
                         synthetic = dict(p["meta"])
@@ -538,7 +541,7 @@ def main():
                         )
                         _dispatch(synthetic)
                         pending.pop(asset_id, None)
-                    elif net < -0.01 and activity_sells.get(asset_id):
+                    elif net < -0.01 and sell_ts:
                         synthetic = dict(p["meta"])
                         synthetic["type"] = "sell"
                         synthetic["size"] = abs(net)
