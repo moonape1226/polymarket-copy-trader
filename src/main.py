@@ -273,7 +273,11 @@ def main():
         tx_hash = row.get("transactionHash") or row.get("txHash") or row.get("tx_hash") or row.get("hash")
         if tx_hash:
             return str(tx_hash), "strong"
-        return f"weak:{asset_id}:{side}:{ts}:{row.get('size', '')}", "weak"
+        try:
+            size = f"{float(row.get('size', 0)):.6f}"
+        except (TypeError, ValueError):
+            size = str(row.get("size", ""))
+        return f"weak:{asset_id}:{side}:{ts}:{size}", "weak"
 
     def _drain_chain_events():
         """Pull OrderFilled events from chain_feed, aggregate per (asset, side),
