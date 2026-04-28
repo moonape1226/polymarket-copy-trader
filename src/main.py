@@ -153,6 +153,7 @@ def main():
     def _run_trade(synth: dict):
         aid = synth.get("asset", "")
         side = (synth.get("type") or "").lower()
+        synth.setdefault("dispatch_at", time.time())
         recently_dispatched[(aid, side)] = time.time()
         lock = _get_asset_lock(aid)
         with lock:
@@ -358,6 +359,9 @@ def main():
                 "size": shares,
                 "price": avg_price,
                 "detection_price": avg_price,
+                "signal_source": "chain",
+                "signal_received_at": b["first_ts"],
+                "detected_at": b["first_ts"],
                 **meta,
             }
             detect_latency = now_ts - b["first_ts"]
@@ -463,6 +467,9 @@ def main():
                     "outcome": bs_pos.get("outcome"),
                     "conditionId": bs_pos.get("conditionId"),
                     "detection_price": ref_price,
+                    "signal_source": "reconcile",
+                    "signal_received_at": last_ts,
+                    "detected_at": now_ts,
                 }
                 age_s = now_ts - last_ts
                 logger.info(
@@ -548,6 +555,7 @@ def main():
                     continue
                 if not p.get("ws_confirmed") and net > 0.01:
                     p["ws_confirmed"] = True
+                    p["ws_confirmed_at"] = now
                     logger.info(
                         f"WS confirmed buy-add: {net:.2f} shares "
                         f"of {p['meta'].get('title')} (deferred to batch flush)"
@@ -591,6 +599,9 @@ def main():
                         synthetic["size"] = abs(net)
                         synthetic["price"] = target_price
                         synthetic["detection_price"] = target_price or p.get("detection_price")
+                        synthetic["signal_source"] = "activity"
+                        synthetic["signal_received_at"] = buy_info["ts"]
+                        synthetic["detected_at"] = p["first_seen"]
                         logger.info(
                             f"Flushing confirmed buy: {abs(net):.2f} shares "
                             f"of {synthetic.get('title')} (target@${target_price:.4f})"
@@ -606,6 +617,9 @@ def main():
                         synthetic["type"] = "sell"
                         synthetic["size"] = abs(net)
                         synthetic["detection_price"] = p.get("detection_price")
+                        synthetic["signal_source"] = "activity"
+                        synthetic["signal_received_at"] = sell_ts
+                        synthetic["detected_at"] = p["first_seen"]
                         logger.info(
                             f"Flushing confirmed sell: {abs(net):.2f} shares "
                             f"of {synthetic.get('title')}"
@@ -697,6 +711,9 @@ def main():
                             continue
 
                     if p.get("ws_confirmed"):
+                        synthetic["signal_source"] = "ws"
+                        synthetic["signal_received_at"] = p.get("ws_confirmed_at", p["first_seen"])
+                        synthetic["detected_at"] = p["first_seen"]
                         logger.info(
                             f"Flushing WS-confirmed buy: {abs(net):.2f} shares "
                             f"of {synthetic.get('title')}"

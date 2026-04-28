@@ -31,6 +31,14 @@ _COPY_DECISIONS_FIELDS = [
     "timestamp", "action", "title", "outcome", "condition_id", "asset_id",
     "bs_price", "bs_size", "bs_usd", "our_price", "our_size", "our_cost", "order_id",
 ]
+_ORDER_METRICS_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "order_metrics.csv")
+_ORDER_METRICS_FIELDS = [
+    "timestamp", "event", "status", "reason", "side", "title", "outcome",
+    "condition_id", "asset_id", "order_id", "order_type", "signal_source",
+    "signal_age_seconds", "signal_received_at", "detected_at", "dispatch_at",
+    "submit_ack_at", "fill_confirmed_at", "confirmed_by", "our_size",
+    "limit_price", "fill_cost",
+]
 _MARKET_CACHE_MAXSIZE = 1000
 _RPC_URL = "https://polygon-bor-rpc.publicnode.com"
 _USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
@@ -275,6 +283,56 @@ class TradingModule:
                     writer.writerow(row)
         except Exception as e:
             logger.warning(f"Failed to write copy_decisions.csv: {e}")
+
+    def _log_order_metric(self, trade_change: Dict[str, Any], event: str,
+                          status: str = "", reason: str = "", order_id: str = "",
+                          order_type: str = "", our_size=None, limit_price=None,
+                          fill_cost=None, fill_confirmed_at=None, confirmed_by: str = ""):
+        submit_ack_at = time.time()
+        signal_received_at = trade_change.get("signal_received_at")
+        dispatch_at = trade_change.get("dispatch_at")
+        detected_at = trade_change.get("detected_at")
+        signal_age = ""
+        try:
+            if signal_received_at:
+                signal_age = round(submit_ack_at - float(signal_received_at), 3)
+        except (TypeError, ValueError):
+            signal_age = ""
+        row = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(submit_ack_at)),
+            "event": event,
+            "status": status,
+            "reason": reason,
+            "side": (trade_change.get("type") or "").lower(),
+            "title": trade_change.get("title", ""),
+            "outcome": trade_change.get("outcome", ""),
+            "condition_id": trade_change.get("conditionId", ""),
+            "asset_id": trade_change.get("asset", ""),
+            "order_id": order_id,
+            "order_type": order_type,
+            "signal_source": trade_change.get("signal_source", ""),
+            "signal_age_seconds": signal_age,
+            "signal_received_at": signal_received_at if signal_received_at is not None else "",
+            "detected_at": detected_at if detected_at is not None else "",
+            "dispatch_at": dispatch_at if dispatch_at is not None else "",
+            "submit_ack_at": submit_ack_at,
+            "fill_confirmed_at": fill_confirmed_at if fill_confirmed_at is not None else "",
+            "confirmed_by": confirmed_by,
+            "our_size": our_size if our_size is not None else "",
+            "limit_price": limit_price if limit_price is not None else "",
+            "fill_cost": fill_cost if fill_cost is not None else "",
+        }
+        path = os.path.abspath(_ORDER_METRICS_CSV)
+        try:
+            with self._csv_lock:
+                write_header = not os.path.exists(path)
+                with open(path, "a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=_ORDER_METRICS_FIELDS)
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerow(row)
+        except Exception as e:
+            logger.warning(f"Failed to write order_metrics.csv: {e}")
 
     def _create_order(self, market_id: str, outcome_id: str, side: str,
                       amount: float, fee: int = 1000, order_type: str = "market",
@@ -776,6 +834,11 @@ class TradingModule:
                             f"({'profit' if is_profit else 'loss'} exit, "
                             f"BS cost ${bs_avg:.4f}, TTL {ttl:.0f}s) — {slug}"
                         )
+                        self._log_order_metric(
+                            trade_change, event="submitted", status="open",
+                            order_id=oid, order_type="limit", our_size=our_size,
+                            limit_price=maker_limit,
+                        )
                         self._log_bot_trade(side, trade_change, our_size,
                                              our_size * maker_limit,
                                              effective_copy_pct, is_low_prob, oid)
@@ -820,6 +883,20 @@ class TradingModule:
                 logger.info(f"Success! Order {order['id']} — actual fill ${fill_cost:.2f}")
             else:
                 logger.info(f"Success! Order {order['id']}")
+
+            fill_confirmed_at = time.time() if fill_cost else None
+            self._log_order_metric(
+                trade_change,
+                event="submitted",
+                status="filled_immediate" if fill_cost else "open",
+                order_id=order.get('id', ''),
+                order_type=otype,
+                our_size=our_size,
+                limit_price=limit_price,
+                fill_cost=fill_cost,
+                fill_confirmed_at=fill_confirmed_at,
+                confirmed_by="sidecar_fills" if fill_cost else "",
+            )
 
             our_cost = fill_cost if fill_cost else (our_size * float(price) if price is not None else 0.0)
             self._log_bot_trade(side, trade_change, our_size, our_cost,
@@ -867,6 +944,9 @@ class TradingModule:
         except Exception as e:
             logger.error(f"Failed to execute copy trade: {e}")
             try:
+                self._log_order_metric(
+                    trade_change, event="failed", status="failed", reason=str(e)[:300]
+                )
                 if trade_change.get('type', '').lower() == 'buy':
                     self._log_copy_decision(trade_change, "FAILED")
             except Exception:
