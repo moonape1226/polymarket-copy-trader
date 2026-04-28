@@ -400,22 +400,30 @@ class TradingModule:
 
             self._append_open_sell_event("cleared", aid, oid, meta, reason)
             cleared += 1
-            if remaining < 0.01 or not meta.get("market_id") or bs_price <= 0:
+            if remaining < 0.01 or not meta.get("market_id"):
                 if current_size > 0:
                     logger.warning(
                         f"Open-sell rehydrate: cannot reissue sell for {meta['slug']} "
-                        f"(remaining={remaining:.2f}, market_id={bool(meta.get('market_id'))}, bs_price={bs_price})"
+                        f"(remaining={remaining:.2f}, market_id={bool(meta.get('market_id'))})"
                     )
                 continue
             if not self.config.get("trading_enabled", False):
                 logger.info(f"Open-sell rehydrate: trading disabled; not reissuing sell for {meta['slug']}")
                 continue
 
+            current_ref = self._get_clob_price(aid, "BUY")
+            current_ref_source = "ask"
+            if not current_ref:
+                current_ref = self._get_clob_price(aid, "SELL")
+                current_ref_source = "bid"
+            if not current_ref:
+                logger.warning(f"Open-sell rehydrate: no current price; not reissuing sell for {meta['slug']}")
+                continue
             is_profit = meta["is_profit"]
             if cost_basis > 0:
-                is_profit = bs_price > cost_basis
+                is_profit = current_ref > cost_basis
             ttl = self.sell_maker_ttl_profit if is_profit else self.sell_maker_ttl_loss
-            maker_limit = round(bs_price, 4)
+            maker_limit = round(current_ref, 4)
             try:
                 new_order = self._create_order(
                     market_id=meta["market_id"], outcome_id=aid, side="sell",
@@ -445,7 +453,8 @@ class TradingModule:
             reissued += 1
             logger.info(
                 f"Open-sell rehydrate: reissued maker sell @ ${maker_limit:.4f} "
-                f"for {remaining:.2f} shares ({reason}) — {meta['slug']}"
+                f"({current_ref_source}, old BS ${bs_price:.4f}) for {remaining:.2f} shares "
+                f"({reason}) — {meta['slug']}"
             )
         if imported or cleared:
             logger.info(
