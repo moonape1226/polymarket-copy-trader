@@ -53,6 +53,7 @@ _VWAP_SKIPPED_FIELDS = [
 ]
 _PROCESSED_BUYS_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "processed_buys.csv")
 _PROCESSED_BUYS_FIELDS = ["timestamp", "asset_id", "tx_hash", "signal_source"]
+_BS_COST_BASIS_JSON = os.path.join(os.path.dirname(__file__), "..", "data", "bs_cost_basis.json")
 _MARKET_CACHE_MAXSIZE = 1000
 _RPC_URL = "https://polygon-bor-rpc.publicnode.com"
 _USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
@@ -112,6 +113,7 @@ class TradingModule:
         self.sell_maker_ttl_profit = float(config.get("sell_maker_ttl_profit_seconds", 120))
         self.sell_maker_ttl_loss = float(config.get("sell_maker_ttl_loss_seconds", 15))
         self._bs_cost_basis: Dict[str, list] = {}          # asset_id → [total_cost, total_size]
+        self._bs_cost_basis_dirty: bool = False
         self._pending_sell_ids: Dict[str, str] = {}        # asset_id → unfilled maker sell order_id
         self._pending_sell_times: Dict[str, float] = {}    # asset_id → placement timestamp
         self._pending_sell_meta: Dict[str, dict] = {}      # asset_id → {shares, ttl, bs_price, slug, market_id, is_profit}
@@ -216,6 +218,48 @@ class TradingModule:
         except Exception as e:
             logger.warning(f"Failed to seed from bot_trades.csv: {e}")
         self._seed_processed_buys()
+        self._load_bs_cost_basis_cache()
+
+    def _load_bs_cost_basis_cache(self):
+        """Seed _bs_cost_basis from disk so a /activity backfill failure at
+        startup does not blank out cost basis. Cache is per-asset
+        [total_cost, total_size]; backfill replaces it on success."""
+        path = os.path.abspath(_BS_COST_BASIS_JSON)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            loaded = 0
+            for aid, v in (data or {}).items():
+                try:
+                    cost, size = float(v[0]), float(v[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if size > 0 and cost >= 0:
+                    self._bs_cost_basis[aid] = [cost, size]
+                    loaded += 1
+            if loaded:
+                logger.info(f"Loaded BS cost basis cache for {loaded} assets")
+        except Exception as e:
+            logger.warning(f"Failed to load BS cost basis cache: {e}")
+
+    def _save_bs_cost_basis_cache(self):
+        path = os.path.abspath(_BS_COST_BASIS_JSON)
+        try:
+            with self._csv_lock:
+                tmp = path + ".tmp"
+                snapshot = {
+                    aid: [round(cost, 6), round(size, 6)]
+                    for aid, (cost, size) in self._bs_cost_basis.items()
+                    if size > 0
+                }
+                with open(tmp, "w") as f:
+                    json.dump(snapshot, f)
+                os.replace(tmp, path)
+            self._bs_cost_basis_dirty = False
+        except Exception as e:
+            logger.warning(f"Failed to save BS cost basis cache: {e}")
 
     def _seed_processed_buys(self):
         path = os.path.abspath(_PROCESSED_BUYS_CSV)
@@ -975,7 +1019,15 @@ class TradingModule:
     def backfill_bs_cost_basis(self, wallets):
         """One-time at startup: pull recent activity per tracked wallet and
         replay BUYs/SELLs into _bs_cost_basis. Without this, early sells after
-        restart fall back to market because cost basis is empty."""
+        restart fall back to market because cost basis is empty.
+
+        On any successful fetch, the in-memory cache is reset to derive
+        purely from /activity (the authoritative source). If every fetch
+        fails, the previously-loaded JSON cache is retained so we still have
+        a baseline."""
+        cached = dict(self._bs_cost_basis)
+        any_success = False
+        fresh: Dict[str, list] = {}
         for w in wallets:
             try:
                 resp = http_requests.get(
@@ -983,30 +1035,53 @@ class TradingModule:
                     timeout=10,
                 )
                 acts = resp.json() if resp.ok else []
+                any_success = any_success or resp.ok
             except Exception as e:
                 logger.warning(f"BS cost-basis backfill failed for {w[:10]}: {e}")
                 continue
             trades = [a for a in acts if a.get("type") == "TRADE"]
             trades.sort(key=lambda x: x.get("timestamp", 0))
             for t in trades:
-                self.update_bs_cost_basis({
+                self._apply_cost_basis(fresh, {
                     "asset": t.get("asset"),
                     "size": t.get("size"),
                     "price": t.get("price"),
                     "type": t.get("side", "").lower(),
                 })
+        if not any_success:
+            if cached:
+                logger.warning("BS cost-basis backfill: all wallets failed; keeping cached snapshot")
+            return
+        # Compare cache vs fresh: warn on >5% per-asset disagreement.
+        for aid, (cost, size) in cached.items():
+            f = fresh.get(aid)
+            if not f or f[1] <= 0:
+                continue
+            if size <= 0:
+                continue
+            cache_avg = cost / size
+            fresh_avg = f[0] / f[1]
+            if abs(cache_avg - fresh_avg) / max(cache_avg, fresh_avg) > 0.05:
+                logger.warning(
+                    f"Cost-basis cache mismatch for {aid[:12]}…: cached avg "
+                    f"${cache_avg:.4f} vs /activity ${fresh_avg:.4f}"
+                )
+        self._bs_cost_basis = fresh
         if self._bs_cost_basis:
             logger.info(f"Backfilled BS cost basis for {sum(1 for v in self._bs_cost_basis.values() if v[1] > 0)} held assets")
+        self._save_bs_cost_basis_cache()
 
-    def update_bs_cost_basis(self, change: Dict[str, Any]):
-        """Size-weighted running avg of BS's cost basis per asset. Updated on
-        every BS trade observed (BUY adds, SELL reduces proportionally)."""
+    @staticmethod
+    def _apply_cost_basis(store: Dict[str, list], change: Dict[str, Any]):
         aid = change.get("asset")
-        sz = float(change.get("size") or 0)
-        px = float(change.get("price") or 0)
+        try:
+            sz = float(change.get("size") or 0)
+            px = float(change.get("price") or 0)
+        except (TypeError, ValueError):
+            return
         if not aid or sz <= 0 or px <= 0:
             return
-        cost, size = self._bs_cost_basis.get(aid, [0.0, 0.0])
+        cost, size = store.get(aid, [0.0, 0.0])
         if (change.get("type") or "").lower() == "buy":
             cost += sz * px
             size += sz
@@ -1017,7 +1092,18 @@ class TradingModule:
                 size = max(0.0, size - sz)
                 if size < 0.01:
                     cost, size = 0.0, 0.0
-        self._bs_cost_basis[aid] = [cost, size]
+        store[aid] = [cost, size]
+
+    def update_bs_cost_basis(self, change: Dict[str, Any]):
+        """Size-weighted running avg of BS's cost basis per asset. Updated on
+        every BS trade observed (BUY adds, SELL reduces proportionally).
+        Persists snapshot to disk so a restart can recover cost basis even
+        if the /activity backfill fails."""
+        before = self._bs_cost_basis.get(change.get("asset", ""), [0.0, 0.0])
+        self._apply_cost_basis(self._bs_cost_basis, change)
+        after = self._bs_cost_basis.get(change.get("asset", ""), [0.0, 0.0])
+        if before != after:
+            self._save_bs_cost_basis_cache()
 
     def get_bs_avg_cost(self, asset_id: str) -> Optional[float]:
         entry = self._bs_cost_basis.get(asset_id)
