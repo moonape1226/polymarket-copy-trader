@@ -186,7 +186,6 @@ def main():
         aid = synth.get("asset", "")
         side = (synth.get("type") or "").lower()
         synth.setdefault("dispatch_at", time.time())
-        recently_dispatched[(aid, side)] = time.time()
         lock = _get_asset_lock(aid)
         with lock:
             try:
@@ -198,6 +197,25 @@ def main():
                 logger.error(f"execute_copy_trade failed for {aid[:12]}…: {e}")
 
     def _dispatch(synth: dict):
+        # Single-source dedup gate: synchronously record the dispatch before
+        # handing the trade to the executor so every signal path (chain feed,
+        # WS fast-lane, /activity flush, batch flush, reconcile, startup
+        # lookback) sees a consistent `recently_dispatched` view. Without this,
+        # WS fast-lane (~2s) could fire on a pending entry that polling created
+        # before chain feed also fired on the same on-chain event, producing
+        # ~2× copy_pct exposure. _run_trade still pops the key on failure to
+        # allow retry.
+        aid = synth.get("asset", "")
+        side = (synth.get("type") or "").lower()
+        rd_ts = recently_dispatched.get((aid, side))
+        if rd_ts is not None and (time.time() - rd_ts) < CHAIN_DEDUP_TTL:
+            logger.info(
+                f"Dispatch suppressed (dedup): {side.upper()} {aid[:12]}… "
+                f"already dispatched {time.time() - rd_ts:.1f}s ago "
+                f"(source={synth.get('signal_source','?')})"
+            )
+            return
+        recently_dispatched[(aid, side)] = time.time()
         executor.submit(_run_trade, synth)
 
     def _metadata_from_states(asset_id: str) -> dict:
@@ -450,7 +468,6 @@ def main():
             except Exception as e:
                 logger.warning(f"update_bs_cost_basis failed for chain event: {e}")
             trading_module._log_copy_decision(synth, "CHAIN_DETECT")
-            recently_dispatched[(b["asset"], b["side"])] = now_ts
             _dispatch(synth)
             # Clear any /positions-derived pending for this asset to prevent double-fire
             pending.pop(b["asset"], None)
@@ -733,7 +750,6 @@ def main():
                 activity_sells[aid] = {
                     "ts": ts, "tx_hash": tx_key, "tx_key_strength": key_strength,
                 }
-                recently_dispatched[(aid, "sell")] = time.time()
                 try:
                     trading_module.update_bs_cost_basis(synth)
                 except Exception as e:
