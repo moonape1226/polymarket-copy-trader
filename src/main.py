@@ -163,6 +163,7 @@ def main():
     # from wallet_states on-demand, and refreshed by a one-shot sync fetch
     # when chain_feed fires on a brand-new asset BS just opened.
     asset_metadata_cache: dict = {}  # asset_id → {title, outcome, conditionId, slug}
+    reconcile_first_asks: dict = {}  # asset_id → {ask, last_ts}; stale unknown-price drift reference
 
     def _get_asset_lock(aid: str) -> threading.Lock:
         with asset_locks_guard:
@@ -429,6 +430,7 @@ def main():
             return
         our_assets = {p.get("asset") for p in our_positions
                        if float(p.get("size", 0)) > 0}
+        active_bs_assets = set()
         for wallet in wallets:
             bs_positions = wallet_states.get(wallet) or []
             activity = _fetch_recent_activity(wallet)
@@ -447,6 +449,7 @@ def main():
                 bs_size = float(bs_pos.get("size", 0))
                 if not aid or bs_size <= 0:
                     continue
+                active_bs_assets.add(aid)
                 if aid in pending:
                     continue
                 if (aid, "buy") in recently_dispatched:
@@ -473,6 +476,11 @@ def main():
                 age_s = now_ts - last_ts
                 bs_avg = _float_or_none(bs_pos.get("avgPrice"))
                 cur_ask = _float_or_none(ws_feed.get_ask(aid))
+                first_ask_entry = reconcile_first_asks.get(aid)
+                if cur_ask and (not first_ask_entry or first_ask_entry.get("last_ts") != last_ts):
+                    first_ask_entry = {"ask": cur_ask, "last_ts": last_ts}
+                    reconcile_first_asks[aid] = first_ask_entry
+                first_ask = _float_or_none((first_ask_entry or {}).get("ask"))
                 ref_price = bs_avg or cur_ask
                 reference_source = "bs_avg" if bs_avg else "detection_price" if cur_ask else "unknown"
                 limit_override = None
@@ -481,6 +489,8 @@ def main():
                 skip_limit_slip = False
 
                 if age_s > RECONCILE_STALE_SECONDS:
+                    ref_price = bs_avg or first_ask
+                    reference_source = "bs_avg" if bs_avg else "detection_price" if first_ask else "unknown"
                     signal_source = "reconcile_stale"
                     action = f"RECONCILE_STALE_BACKFILL_{reference_source.upper()}"
                     if not cur_ask or not ref_price:
@@ -584,6 +594,9 @@ def main():
                     our_cost=round(missed * limit_override, 6) if limit_override else None,
                 )
                 _dispatch(synth)
+        for aid in list(reconcile_first_asks):
+            if aid not in active_bs_assets:
+                reconcile_first_asks.pop(aid, None)
 
     try:
         while True:
