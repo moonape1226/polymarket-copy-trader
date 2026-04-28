@@ -506,7 +506,6 @@ def main():
                         rd_ts = recently_dispatched.get((asset_id, side_lc))
                         if rd_ts and (time.time() - rd_ts) < CHAIN_DEDUP_TTL:
                             continue
-                        trading_module.update_bs_cost_basis(change)
 
                         if asset_id not in pending:
                             pending[asset_id] = {
@@ -596,6 +595,10 @@ def main():
                             f"Flushing confirmed buy: {abs(net):.2f} shares "
                             f"of {synthetic.get('title')} (target@${target_price:.4f})"
                         )
+                        try:
+                            trading_module.update_bs_cost_basis(synthetic)
+                        except Exception as e:
+                            logger.warning(f"update_bs_cost_basis failed for confirmed buy: {e}")
                         _dispatch(synthetic)
                         pending.pop(asset_id, None)
                     elif net < -0.01 and sell_ts:
@@ -607,6 +610,10 @@ def main():
                             f"Flushing confirmed sell: {abs(net):.2f} shares "
                             f"of {synthetic.get('title')}"
                         )
+                        try:
+                            trading_module.update_bs_cost_basis(synthetic)
+                        except Exception as e:
+                            logger.warning(f"update_bs_cost_basis failed for confirmed sell: {e}")
                         _dispatch(synthetic)
                         pending.pop(asset_id, None)
 
@@ -694,6 +701,10 @@ def main():
                             f"Flushing WS-confirmed buy: {abs(net):.2f} shares "
                             f"of {synthetic.get('title')}"
                         )
+                        try:
+                            trading_module.update_bs_cost_basis(synthetic)
+                        except Exception as e:
+                            logger.warning(f"update_bs_cost_basis failed for WS-confirmed buy: {e}")
                         _dispatch(synthetic)
                         to_remove.append(asset_id)
                     elif age < TRADE_CONFIRM_SECONDS:
