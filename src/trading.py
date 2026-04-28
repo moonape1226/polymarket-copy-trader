@@ -51,6 +51,8 @@ _VWAP_SKIPPED_FIELDS = [
     "bs_size", "bs_avg_price", "reference_price", "our_size", "our_vwap_estimate",
     "bucket", "bucket_tolerance", "reference_source", "skip_reason", "gate_action",
 ]
+_PROCESSED_BUYS_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "processed_buys.csv")
+_PROCESSED_BUYS_FIELDS = ["timestamp", "asset_id", "tx_hash", "signal_source"]
 _MARKET_CACHE_MAXSIZE = 1000
 _RPC_URL = "https://polygon-bor-rpc.publicnode.com"
 _USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
@@ -114,6 +116,7 @@ class TradingModule:
         self._pending_sell_times: Dict[str, float] = {}    # asset_id → placement timestamp
         self._pending_sell_meta: Dict[str, dict] = {}      # asset_id → {shares, ttl, bs_price, slug, market_id, is_profit}
         self._processed_sell_tx_hashes = set()
+        self._processed_buy_tx_hashes = set()
         self._bs_hold_checker = None
         self._ws_feed = ws_feed
         self._csv_lock = threading.Lock()
@@ -212,6 +215,42 @@ class TradingModule:
                 logger.info(f"Seeded {len(self._asset_copy_rate)} assets from bot_trades.csv")
         except Exception as e:
             logger.warning(f"Failed to seed from bot_trades.csv: {e}")
+        self._seed_processed_buys()
+
+    def _seed_processed_buys(self):
+        path = os.path.abspath(_PROCESSED_BUYS_CSV)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, newline="") as f:
+                for row in csv.DictReader(f):
+                    tx = (row.get("tx_hash") or "").strip()
+                    if tx:
+                        self._processed_buy_tx_hashes.add(tx)
+            if self._processed_buy_tx_hashes:
+                logger.info(f"Seeded {len(self._processed_buy_tx_hashes)} buy tx_hashes from processed_buys.csv")
+        except Exception as e:
+            logger.warning(f"Failed to seed processed_buys.csv: {e}")
+
+    def _record_processed_buy_tx(self, tx_hashes, asset_id: str, signal_source: str):
+        if not tx_hashes:
+            return
+        path = os.path.abspath(_PROCESSED_BUYS_CSV)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+        try:
+            with self._csv_lock:
+                write_header = not os.path.exists(path)
+                with open(path, "a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=_PROCESSED_BUYS_FIELDS)
+                    if write_header:
+                        writer.writeheader()
+                    for tx in tx_hashes:
+                        writer.writerow({
+                            "timestamp": ts, "asset_id": asset_id,
+                            "tx_hash": tx, "signal_source": signal_source,
+                        })
+        except Exception as e:
+            logger.warning(f"Failed to write processed_buys.csv: {e}")
 
     def _clear_pending(self, asset_id: str) -> None:
         self._pending_order_ids.pop(asset_id, None)
@@ -1067,19 +1106,26 @@ class TradingModule:
             side = trade_change['type'].lower()  # 'buy' or 'sell'
             asset_id = trade_change['asset']
             sell_tx_hashes = []
+            buy_tx_hashes = []
+            raw_tx_hashes = (
+                trade_change.get("tx_hashes") or trade_change.get("tx_hash")
+                or trade_change.get("transactionHash") or ""
+            )
+            if isinstance(raw_tx_hashes, (list, set, tuple)):
+                parsed_tx_hashes = [str(h).strip() for h in raw_tx_hashes if str(h).strip()]
+            else:
+                parsed_tx_hashes = [
+                    h.strip() for h in str(raw_tx_hashes).replace(";", ",").split(",") if h.strip()
+                ]
             if side == 'sell':
-                raw_tx_hashes = (
-                    trade_change.get("tx_hashes") or trade_change.get("tx_hash")
-                    or trade_change.get("transactionHash") or ""
-                )
-                if isinstance(raw_tx_hashes, (list, set, tuple)):
-                    sell_tx_hashes = [str(h).strip() for h in raw_tx_hashes if str(h).strip()]
-                else:
-                    sell_tx_hashes = [
-                        h.strip() for h in str(raw_tx_hashes).replace(";", ",").split(",") if h.strip()
-                    ]
+                sell_tx_hashes = parsed_tx_hashes
                 if sell_tx_hashes and any(h in self._processed_sell_tx_hashes for h in sell_tx_hashes):
                     logger.info(f"Skipping sell: BS tx already processed for {asset_id[:12]}")
+                    return
+            elif side == 'buy':
+                buy_tx_hashes = parsed_tx_hashes
+                if buy_tx_hashes and any(h in self._processed_buy_tx_hashes for h in buy_tx_hashes):
+                    logger.info(f"Skipping buy: BS tx already processed for {asset_id[:12]}")
                     return
             original_size = float(trade_change['size'])
             slug = trade_change.get('slug')
@@ -1412,6 +1458,12 @@ class TradingModule:
 
             # Update exposure tracking
             if side == 'buy':
+                if buy_tx_hashes:
+                    self._processed_buy_tx_hashes.update(buy_tx_hashes)
+                    self._record_processed_buy_tx(
+                        buy_tx_hashes, asset_id,
+                        trade_change.get("signal_source", ""),
+                    )
                 self._asset_copy_rate[asset_id] = effective_copy_pct
                 self._asset_is_low_prob[asset_id] = is_low_prob
                 if otype == 'limit':
