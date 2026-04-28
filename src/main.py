@@ -157,8 +157,11 @@ def main():
         lock = _get_asset_lock(aid)
         with lock:
             try:
-                trading_module.execute_copy_trade(synth)
+                result = trading_module.execute_copy_trade(synth)
+                if result is False:
+                    recently_dispatched.pop((aid, side), None)
             except Exception as e:
+                recently_dispatched.pop((aid, side), None)
                 logger.error(f"execute_copy_trade failed for {aid[:12]}…: {e}")
 
     def _dispatch(synth: dict):

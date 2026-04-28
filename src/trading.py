@@ -871,3 +871,4 @@ class TradingModule:
                     self._log_copy_decision(trade_change, "FAILED")
             except Exception:
                 pass
+            return False
