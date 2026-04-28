@@ -83,6 +83,7 @@ class TradingModule:
         self._pending_order_times: Dict[str, float] = {}   # asset_id → order placement timestamp
         self._pending_order_meta: Dict[str, dict] = {}     # asset_id → {limit_price, title}
         self._pending_order_shares: Dict[str, float] = {}  # asset_id → unfilled shares on pending order
+        self._pending_order_base_shares: Dict[str, float] = {}  # asset_id → held shares before placing/importing order
         self._pending_order_cost: Dict[str, float] = {}    # asset_id → USD cost of pending order
         # Sell-side maker-with-TTL tracking (profit: long TTL, loss: short TTL)
         self.sell_maker_ttl_profit = float(config.get("sell_maker_ttl_profit_seconds", 120))
@@ -135,6 +136,11 @@ class TradingModule:
         cancelled_dup = 0
         sells_left = 0
         now = time.time()
+        base_shares = {}
+        try:
+            base_shares = {p.outcome_id: float(p.size) for p in self.poly.fetch_positions()}
+        except Exception as e:
+            logger.warning(f"Orphan-cleanup: fetch_positions failed: {e}")
         for o in orders:
             if str(o.side).lower() != 'buy':
                 sells_left += 1
@@ -153,6 +159,7 @@ class TradingModule:
             self._pending_order_times[aid] = now
             self._pending_order_meta[aid] = {"limit_price": price, "title": ""}
             self._pending_order_shares[aid] = size
+            self._pending_order_base_shares[aid] = base_shares.get(aid, 0.0)
             self._pending_order_cost[aid] = size * price
             imported += 1
         logger.info(
@@ -186,6 +193,7 @@ class TradingModule:
         self._pending_order_times.pop(asset_id, None)
         self._pending_order_meta.pop(asset_id, None)
         self._pending_order_shares.pop(asset_id, None)
+        self._pending_order_base_shares.pop(asset_id, None)
         self._pending_order_cost.pop(asset_id, None)
 
     def _log_gtc_cancelled(self, asset_id: str, placed_at: float, reason: str):
@@ -358,16 +366,13 @@ class TradingModule:
             self._asset_shares = new_shares
             self._low_prob_exposure = new_low_prob_exposure
             self._exposure_last_refresh = time.time()
-            # Clear pending only when on-chain shares cover the pending order
-            # size. Clearing on any on_chain>0 drops tracking while the limit
-            # is partially filled; the unfilled remainder sits untracked on
-            # book, so the next dispatch's cancel-old step finds no old_id
-            # and stacks a second limit. Repeated reconcile cycles compound
-            # this — see Chicago 56-57°F 04-27 (9718 sh vs BS 3105 sh).
+            # Clear pending only when new on-chain shares cover the pending
+            # order size. Existing shares from earlier fills must not count.
             for asset_id in list(self._pending_order_ids):
                 on_chain = new_shares.get(asset_id, 0.0)
                 pending_sh = self._pending_order_shares.get(asset_id, 0.0)
-                if on_chain >= pending_sh - 1e-6:
+                base_sh = self._pending_order_base_shares.get(asset_id, 0.0)
+                if on_chain - base_sh >= pending_sh - 1e-6:
                     self._clear_pending(asset_id)
 
             # Merge pending-order cost into exposure so max_position cap counts
@@ -836,6 +841,7 @@ class TradingModule:
                         "title": trade_change.get("title", ""),
                     }
                     self._pending_order_shares[asset_id] = our_size
+                    self._pending_order_base_shares[asset_id] = self._asset_shares.get(asset_id, 0.0)
                     self._pending_order_cost[asset_id] = our_size * float(limit_price) if limit_price else 0.0
                 if price is not None:
                     self._asset_exposure[asset_id] = self._asset_exposure.get(asset_id, 0.0) + our_size * float(price)
