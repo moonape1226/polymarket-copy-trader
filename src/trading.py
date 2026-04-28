@@ -37,7 +37,7 @@ _ORDER_METRICS_FIELDS = [
     "condition_id", "asset_id", "order_id", "order_type", "signal_source",
     "signal_age_seconds", "signal_received_at", "detected_at", "dispatch_at",
     "submit_ack_at", "fill_confirmed_at", "confirmed_by", "our_size",
-    "limit_price", "fill_cost",
+    "limit_price", "fill_cost", "placed_at", "expires_at", "bs_holds_at_expiry",
 ]
 _MARKET_CACHE_MAXSIZE = 1000
 _RPC_URL = "https://polygon-bor-rpc.publicnode.com"
@@ -93,6 +93,7 @@ class TradingModule:
         self._pending_order_shares: Dict[str, float] = {}  # asset_id → unfilled shares on pending order
         self._pending_order_base_shares: Dict[str, float] = {}  # asset_id → held shares before placing/importing order
         self._pending_order_cost: Dict[str, float] = {}    # asset_id → USD cost of pending order
+        self._pending_order_entry_ttl: Dict[str, float] = {}  # asset_id → seconds before entry cancel
         # Sell-side maker-with-TTL tracking (profit: long TTL, loss: short TTL)
         self.sell_maker_ttl_profit = float(config.get("sell_maker_ttl_profit_seconds", 120))
         self.sell_maker_ttl_loss = float(config.get("sell_maker_ttl_loss_seconds", 15))
@@ -169,6 +170,7 @@ class TradingModule:
             self._pending_order_shares[aid] = size
             self._pending_order_base_shares[aid] = base_shares.get(aid, 0.0)
             self._pending_order_cost[aid] = size * price
+            self._pending_order_entry_ttl[aid] = self._buy_entry_ttl_seconds(price)
             imported += 1
         logger.info(
             f"Orphan-cleanup: imported {imported} buys, cancelled {cancelled_dup} duplicates, "
@@ -203,6 +205,28 @@ class TradingModule:
         self._pending_order_shares.pop(asset_id, None)
         self._pending_order_base_shares.pop(asset_id, None)
         self._pending_order_cost.pop(asset_id, None)
+        self._pending_order_entry_ttl.pop(asset_id, None)
+
+    def _buy_entry_ttl_seconds(self, ref_price: Optional[float]) -> float:
+        buckets = self.config.get("buy_entry_ttl_seconds_by_bucket", {})
+        price = float(ref_price or 0)
+        if price < 0.05:
+            return float(buckets.get("lt_0_05", 30))
+        if price < 0.15:
+            return float(buckets.get("0_05_to_0_15", 15))
+        if price < 0.50:
+            return float(buckets.get("0_15_to_0_50", 10))
+        return float(buckets.get("gte_0_50", 8))
+
+    def _bs_holds_asset(self, asset_id: str) -> str:
+        for wallet in self.config.get("wallets_to_track", []):
+            positions = get_user_positions(wallet)
+            if positions is None:
+                return "unknown"
+            for p in positions:
+                if p.get("asset") == asset_id and float(p.get("size", 0)) > 0:
+                    return "true"
+        return "false"
 
     def _log_gtc_cancelled(self, asset_id: str, placed_at: float, reason: str):
         meta = self._pending_order_meta.get(asset_id, {})
@@ -287,7 +311,8 @@ class TradingModule:
     def _log_order_metric(self, trade_change: Dict[str, Any], event: str,
                           status: str = "", reason: str = "", order_id: str = "",
                           order_type: str = "", our_size=None, limit_price=None,
-                          fill_cost=None, fill_confirmed_at=None, confirmed_by: str = ""):
+                          fill_cost=None, fill_confirmed_at=None, confirmed_by: str = "",
+                          placed_at=None, expires_at=None, bs_holds_at_expiry=None):
         submit_ack_at = time.time()
         signal_received_at = trade_change.get("signal_received_at")
         dispatch_at = trade_change.get("dispatch_at")
@@ -321,6 +346,9 @@ class TradingModule:
             "our_size": our_size if our_size is not None else "",
             "limit_price": limit_price if limit_price is not None else "",
             "fill_cost": fill_cost if fill_cost is not None else "",
+            "placed_at": placed_at if placed_at is not None else "",
+            "expires_at": expires_at if expires_at is not None else "",
+            "bs_holds_at_expiry": bs_holds_at_expiry if bs_holds_at_expiry is not None else "",
         }
         path = os.path.abspath(_ORDER_METRICS_CSV)
         try:
@@ -399,7 +427,56 @@ class TradingModule:
         self._market_cache[slug] = market_id
         return market_id
 
-    def _refresh_exposure(self):
+    def _cancel_expired_pending_buys(self) -> None:
+        if self.gtc_order_ttl <= 0 or not self._pending_order_times:
+            return
+        now = time.time()
+        for asset_id in list(self._pending_order_times):
+            placed_at = self._pending_order_times[asset_id]
+            ttl = self._pending_order_entry_ttl.get(asset_id, self.gtc_order_ttl)
+            if now - placed_at <= ttl:
+                continue
+            oid = self._pending_order_ids.get(asset_id)
+            if oid:
+                try:
+                    self.poly.cancel_order(oid)
+                    logger.info(f"Cancelled unfilled entry order ({ttl:.0f}s TTL) — {asset_id[:12]}")
+                except Exception as e:
+                    logger.warning(f"Failed to cancel expired entry order: {e}")
+                    continue
+            meta = self._pending_order_meta.get(asset_id, {})
+            bs_holds = self._bs_holds_asset(asset_id)
+            self._log_order_metric(
+                {
+                    "asset": asset_id,
+                    "type": "buy",
+                    "title": meta.get("title", ""),
+                    "signal_source": meta.get("signal_source", ""),
+                    "signal_received_at": meta.get("signal_received_at"),
+                    "detected_at": meta.get("detected_at"),
+                },
+                event="cancelled", status="cancelled", reason="entry_ttl",
+                order_id=oid or "", order_type="limit",
+                our_size=self._pending_order_shares.get(asset_id),
+                limit_price=meta.get("limit_price"), placed_at=placed_at,
+                expires_at=placed_at + ttl, bs_holds_at_expiry=bs_holds,
+            )
+            self._log_gtc_cancelled(asset_id, placed_at, "entry_ttl")
+            self._clear_pending(asset_id)
+
+    def check_pending_buys(self):
+        if not self._pending_order_times:
+            return
+        now = time.time()
+        if not any(
+            now - placed_at > self._pending_order_entry_ttl.get(asset_id, self.gtc_order_ttl)
+            for asset_id, placed_at in self._pending_order_times.items()
+        ):
+            return
+        self._refresh_exposure(cancel_expired=False)
+        self._cancel_expired_pending_buys()
+
+    def _refresh_exposure(self, cancel_expired: bool = True):
         """Rebuild _asset_exposure, _asset_shares, and _low_prob_exposure from on-chain positions."""
         try:
             all_positions = get_user_positions(self._proxy_address)
@@ -439,21 +516,8 @@ class TradingModule:
             for asset_id, pending_cost in self._pending_order_cost.items():
                 self._asset_exposure[asset_id] = self._asset_exposure.get(asset_id, 0.0) + pending_cost
 
-            # Cancel GTC orders that have been sitting too long
-            if self.gtc_order_ttl > 0:
-                now = time.time()
-                for asset_id in list(self._pending_order_times):
-                    if now - self._pending_order_times[asset_id] > self.gtc_order_ttl:
-                        oid = self._pending_order_ids.get(asset_id)
-                        if oid:
-                            try:
-                                self.poly.cancel_order(oid)
-                                logger.info(f"Cancelled stale GTC order ({self.gtc_order_ttl/60:.0f}min TTL) — {asset_id[:12]}")
-                            except Exception as e:
-                                logger.warning(f"Failed to cancel stale order: {e}")
-                        placed_at = self._pending_order_times[asset_id]
-                        self._log_gtc_cancelled(asset_id, placed_at, "ttl_expired")
-                        self._clear_pending(asset_id)
+            if cancel_expired:
+                self._cancel_expired_pending_buys()
 
             logger.debug(f"Refreshed exposure: {len(new_exposure)} positions, low_prob ${new_low_prob_exposure:.2f}")
         except Exception as e:
@@ -912,14 +976,21 @@ class TradingModule:
                 self._asset_is_low_prob[asset_id] = is_low_prob
                 if otype == 'limit':
                     self._pending_order_ids[asset_id] = order['id']
-                    self._pending_order_times[asset_id] = time.time()
+                    placed_at = time.time()
+                    entry_ref_price = trade_change.get('price') or limit_price
+                    entry_ttl = self._buy_entry_ttl_seconds(entry_ref_price)
+                    self._pending_order_times[asset_id] = placed_at
                     self._pending_order_meta[asset_id] = {
                         "limit_price": limit_price,
                         "title": trade_change.get("title", ""),
+                        "signal_source": trade_change.get("signal_source", ""),
+                        "signal_received_at": trade_change.get("signal_received_at"),
+                        "detected_at": trade_change.get("detected_at"),
                     }
                     self._pending_order_shares[asset_id] = our_size
                     self._pending_order_base_shares[asset_id] = self._asset_shares.get(asset_id, 0.0)
                     self._pending_order_cost[asset_id] = our_size * float(limit_price) if limit_price else 0.0
+                    self._pending_order_entry_ttl[asset_id] = entry_ttl
                 if price is not None:
                     self._asset_exposure[asset_id] = self._asset_exposure.get(asset_id, 0.0) + our_size * float(price)
                 self._asset_shares[asset_id] = self._asset_shares.get(asset_id, 0.0) + our_size

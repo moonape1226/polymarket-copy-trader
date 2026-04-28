@@ -750,6 +750,11 @@ def main():
                     logger.error(f"Reconcile failed: {e}")
 
             try:
+                trading_module.check_pending_buys()
+            except Exception as e:
+                logger.error(f"check_pending_buys failed: {e}")
+
+            try:
                 trading_module.check_pending_sells()
             except Exception as e:
                 logger.error(f"check_pending_sells failed: {e}")
