@@ -107,6 +107,7 @@ class TradingModule:
         self._pending_sell_ids: Dict[str, str] = {}        # asset_id → unfilled maker sell order_id
         self._pending_sell_times: Dict[str, float] = {}    # asset_id → placement timestamp
         self._pending_sell_meta: Dict[str, dict] = {}      # asset_id → {shares, ttl, bs_price, slug, market_id, is_profit}
+        self._processed_sell_tx_hashes = set()
         self._bs_hold_checker = None
         self._ws_feed = ws_feed
         self._csv_lock = threading.Lock()
@@ -309,6 +310,12 @@ class TradingModule:
                     oid = row.get("order_id", "")
                     if not oid:
                         continue
+                    tx_hash = row.get("bs_sell_tx_hash", "")
+                    if tx_hash:
+                        for h in str(tx_hash).replace(";", ",").split(","):
+                            h = h.strip()
+                            if h:
+                                self._processed_sell_tx_hashes.add(h)
                     if row.get("event") == "placed":
                         active[oid] = row
                     elif row.get("event") == "cleared":
@@ -323,28 +330,33 @@ class TradingModule:
         except Exception as e:
             logger.warning(f"Open-sell rehydrate: fetch_open_orders failed: {e}")
             return
+        try:
+            pos_sizes = {p.outcome_id: float(p.size) for p in self.poly.fetch_positions()}
+        except Exception as e:
+            logger.warning(f"Open-sell rehydrate: fetch_positions failed: {e}")
+            return
         imported = 0
         cleared = 0
+        reissued = 0
+        now = time.time()
         for oid, row in active.items():
             order = open_orders.get(oid)
             aid = row.get("asset_id", "")
-            if not order or str(order.side).lower() != "sell" or not aid:
-                self._append_open_sell_event("cleared", aid, oid, reason="missing_on_startup")
+            if not aid:
+                self._append_open_sell_event("cleared", aid, oid, reason="missing_asset_on_startup")
                 cleared += 1
                 continue
             try:
                 placed_at = float(row.get("placed_at") or time.time())
                 ttl = float(row.get("ttl") or 60)
-                shares = float(row.get("shares") or order.size)
+                shares = float(row.get("shares") or getattr(order, "size", 0))
                 initial_position = float(row.get("initial_position") or shares)
                 bs_price = float(row.get("bs_price") or 0)
                 cost_basis = float(row.get("cost_basis") or 0)
             except (TypeError, ValueError) as e:
                 logger.warning(f"Open-sell rehydrate: bad row for {oid[:16]}: {e}")
                 continue
-            self._pending_sell_ids[aid] = oid
-            self._pending_sell_times[aid] = placed_at
-            self._pending_sell_meta[aid] = {
+            meta = {
                 "shares": shares,
                 "ttl": ttl,
                 "bs_price": bs_price,
@@ -356,9 +368,90 @@ class TradingModule:
                 "placed_at": placed_at,
                 "bs_sell_tx_hash": row.get("bs_sell_tx_hash", ""),
             }
+            current_size = pos_sizes.get(aid, 0.0)
+            already_filled = max(0.0, initial_position - current_size)
+            remaining = max(0.0, min(shares - already_filled, current_size))
+            order_is_live = bool(order and str(order.side).lower() == "sell")
+            reason = ""
+
+            if order_is_live and now - placed_at <= ttl:
+                self._pending_sell_ids[aid] = oid
+                self._pending_sell_times[aid] = placed_at
+                self._pending_sell_meta[aid] = meta
+                imported += 1
+                continue
+
+            if order_is_live:
+                try:
+                    self.poly.cancel_order(oid)
+                    reason = "ttl_expired_on_startup"
+                    logger.info(f"Open-sell rehydrate: cancelled TTL-expired sell {oid[:16]} for {meta['slug']}")
+                except Exception as e:
+                    logger.warning(f"Open-sell rehydrate: cancel {oid[:16]} failed: {e}")
+                    self._pending_sell_ids[aid] = oid
+                    self._pending_sell_times[aid] = now
+                    self._pending_sell_meta[aid] = {**meta, "placed_at": now}
+                    imported += 1
+                    continue
+            elif current_size <= 0.0:
+                reason = "filled_offline"
+            else:
+                reason = "missing_on_startup"
+
+            self._append_open_sell_event("cleared", aid, oid, meta, reason)
+            cleared += 1
+            if remaining < 0.01 or not meta.get("market_id") or bs_price <= 0:
+                if current_size > 0:
+                    logger.warning(
+                        f"Open-sell rehydrate: cannot reissue sell for {meta['slug']} "
+                        f"(remaining={remaining:.2f}, market_id={bool(meta.get('market_id'))}, bs_price={bs_price})"
+                    )
+                continue
+            if not self.config.get("trading_enabled", False):
+                logger.info(f"Open-sell rehydrate: trading disabled; not reissuing sell for {meta['slug']}")
+                continue
+
+            is_profit = meta["is_profit"]
+            if cost_basis > 0:
+                is_profit = bs_price > cost_basis
+            ttl = self.sell_maker_ttl_profit if is_profit else self.sell_maker_ttl_loss
+            maker_limit = round(bs_price, 4)
+            try:
+                new_order = self._create_order(
+                    market_id=meta["market_id"], outcome_id=aid, side="sell",
+                    amount=remaining, order_type="limit", price=maker_limit,
+                )
+            except Exception as e:
+                logger.warning(f"Open-sell rehydrate: reissue sell failed for {meta['slug']}: {e}")
+                continue
+            new_oid = new_order.get("id", "")
+            if not new_oid:
+                logger.warning(f"Open-sell rehydrate: reissue sell returned no order id for {meta['slug']}")
+                continue
+            new_placed_at = time.time()
+            new_meta = {
+                **meta,
+                "shares": remaining,
+                "ttl": ttl,
+                "is_profit": is_profit,
+                "initial_position": current_size,
+                "placed_at": new_placed_at,
+            }
+            self._pending_sell_ids[aid] = new_oid
+            self._pending_sell_times[aid] = new_placed_at
+            self._pending_sell_meta[aid] = new_meta
+            self._append_open_sell_event("placed", aid, new_oid, new_meta)
             imported += 1
+            reissued += 1
+            logger.info(
+                f"Open-sell rehydrate: reissued maker sell @ ${maker_limit:.4f} "
+                f"for {remaining:.2f} shares ({reason}) — {meta['slug']}"
+            )
         if imported or cleared:
-            logger.info(f"Open-sell rehydrate: imported {imported}, cleared {cleared} stale row(s)")
+            logger.info(
+                f"Open-sell rehydrate: imported {imported}, reissued {reissued}, "
+                f"cleared {cleared} stale row(s)"
+            )
 
     def _log_bot_trade(self, side: str, trade_change: Dict[str, Any],
                        our_shares: float, our_cost: float,
@@ -778,6 +871,21 @@ class TradingModule:
         try:
             side = trade_change['type'].lower()  # 'buy' or 'sell'
             asset_id = trade_change['asset']
+            sell_tx_hashes = []
+            if side == 'sell':
+                raw_tx_hashes = (
+                    trade_change.get("tx_hashes") or trade_change.get("tx_hash")
+                    or trade_change.get("transactionHash") or ""
+                )
+                if isinstance(raw_tx_hashes, (list, set, tuple)):
+                    sell_tx_hashes = [str(h).strip() for h in raw_tx_hashes if str(h).strip()]
+                else:
+                    sell_tx_hashes = [
+                        h.strip() for h in str(raw_tx_hashes).replace(";", ",").split(",") if h.strip()
+                    ]
+                if sell_tx_hashes and any(h in self._processed_sell_tx_hashes for h in sell_tx_hashes):
+                    logger.info(f"Skipping sell: BS tx already processed for {asset_id[:12]}")
+                    return
             original_size = float(trade_change['size'])
             slug = trade_change.get('slug')
             raw_bs_price = trade_change.get('price')
@@ -1012,11 +1120,12 @@ class TradingModule:
                             "is_profit": is_profit, "cost_basis": bs_avg,
                             "initial_position": float(our_positions[asset_id].size),
                             "placed_at": placed_at,
-                            "bs_sell_tx_hash": trade_change.get("tx_hash") or trade_change.get("transactionHash") or "",
+                            "bs_sell_tx_hash": ",".join(sell_tx_hashes),
                         }
                         self._append_open_sell_event(
                             "placed", asset_id, oid, self._pending_sell_meta[asset_id]
                         )
+                        self._processed_sell_tx_hashes.update(sell_tx_hashes)
                         logger.info(
                             f"Maker sell @ ${maker_limit:.4f} "
                             f"({'profit' if is_profit else 'loss'} exit, "
@@ -1121,6 +1230,7 @@ class TradingModule:
                 if is_low_prob and price is not None:
                     self._low_prob_exposure += our_size * float(price)
             elif side == 'sell':
+                self._processed_sell_tx_hashes.update(sell_tx_hashes)
                 shares_held = self._asset_shares.get(asset_id, 0.0)
                 if shares_held > 0:
                     fraction_sold = min(our_size / shares_held, 1.0)

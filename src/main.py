@@ -374,6 +374,7 @@ def main():
                 "size": shares,
                 "price": avg_price,
                 "detection_price": avg_price,
+                "tx_hashes": sorted(b["tx_hashes"]),
                 "signal_source": "chain",
                 "signal_received_at": b["first_ts"],
                 "detected_at": b["first_ts"],
@@ -589,10 +590,15 @@ def main():
                                 if not prev or ts > prev["ts"]:
                                     activity_buys[asset_id] = {"ts": ts, "price": float(r.get("price", 0))}
                             elif side == "SELL":
-                                activity_sells[asset_id] = max(activity_sells.get(asset_id, 0), ts)
+                                prev = activity_sells.get(asset_id)
+                                if not prev or ts > prev["ts"]:
+                                    activity_sells[asset_id] = {
+                                        "ts": ts,
+                                        "tx_hash": r.get("transactionHash") or r.get("txHash") or r.get("hash") or "",
+                                    }
                 cutoff = now - ACTIVITY_WINDOW
                 activity_buys = {k: v for k, v in activity_buys.items() if v["ts"] > cutoff}
-                activity_sells = {k: v for k, v in activity_sells.items() if v > cutoff}
+                activity_sells = {k: v for k, v in activity_sells.items() if v["ts"] > cutoff}
                 last_activity_poll = now
 
                 # Immediately flush confirmed pending trades
@@ -604,7 +610,8 @@ def main():
                     # it's from an earlier buy on the same asset — don't use its price.
                     if buy_info and (p["first_seen"] - buy_info["ts"]) > 60:
                         buy_info = None
-                    sell_ts = activity_sells.get(asset_id)
+                    sell_info = activity_sells.get(asset_id)
+                    sell_ts = sell_info["ts"] if sell_info else None
                     if sell_ts and (p["first_seen"] - sell_ts) > 60:
                         sell_ts = None
                     if net > 0.01 and buy_info:
@@ -632,6 +639,7 @@ def main():
                         synthetic["type"] = "sell"
                         synthetic["size"] = abs(net)
                         synthetic["detection_price"] = p.get("detection_price")
+                        synthetic["tx_hash"] = sell_info.get("tx_hash", "") if sell_info else ""
                         synthetic["signal_source"] = "activity"
                         synthetic["signal_received_at"] = sell_ts
                         synthetic["detected_at"] = p["first_seen"]
