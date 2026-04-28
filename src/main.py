@@ -113,7 +113,12 @@ def main():
 
     BATCH_WINDOW = config.get("batch_window_seconds", 180)
     MAX_PENDING  = config.get("max_pending_seconds", 300)
-    WS_FAST_LANE_GRACE = float(config.get("ws_fast_lane_grace_seconds", 2.0))
+    # 5s grace gives the second leg of a YES+NO split time to land in
+    # /positions polling before fast-lane fires on the first leg. With 2s,
+    # an unequal /positions indexing latency between outcomes (observed up
+    # to ~3-4s) could let YES dispatch alone before NO appeared in pending,
+    # leaving an unhedged single-side buy. Configurable for testing.
+    WS_FAST_LANE_GRACE = float(config.get("ws_fast_lane_grace_seconds", 5.0))
     # How long to wait for /activity confirmation before discarding as flicker.
     # 13–42s empirically; 60s gives comfortable margin.
     TRADE_CONFIRM_SECONDS = config.get("trade_confirm_seconds",
@@ -866,6 +871,27 @@ def main():
                             cid_buy_info.setdefault(cid, {})[outcome] = {
                                 "price": float(price), "size": p["net_size"],
                             }
+                # Also union with chain_pending buy buckets: chain feed may
+                # have observed the second leg of a split before /positions
+                # polling indexes it. Without this, a split where the chain
+                # bucket holds NO but pending has only YES would still let
+                # fast-lane fire on YES alone.
+                for (chain_aid, chain_side), bucket in chain_pending.items():
+                    if chain_side != "buy":
+                        continue
+                    meta = (_metadata_from_states(chain_aid)
+                            or asset_metadata_cache.get(chain_aid, {}))
+                    cid = meta.get("conditionId")
+                    outcome = (meta.get("outcome") or "").lower()
+                    if not cid or outcome not in ("yes", "no"):
+                        continue
+                    shares = bucket["shares"]
+                    if shares <= 0:
+                        continue
+                    avg_price = bucket["usd"] / shares
+                    cid_buy_info.setdefault(cid, {}).setdefault(outcome, {
+                        "price": avg_price, "size": shares,
+                    })
                 hedged_fast_cids: set = set()
                 for cid, sides in cid_buy_info.items():
                     if "yes" in sides and "no" in sides:
