@@ -81,10 +81,10 @@ def main():
     def fetch_positions_safe(wallet_address):
         return get_user_positions(wallet_address)
 
-    # Initialize state — pre-seed with [] so a fetch failure doesn't produce a
-    # false-new-position baseline on the first successful poll.
+    # Initialize state. A fetch failure leaves the wallet uninitialized; the
+    # first successful fetch becomes the baseline and is not diffed.
     logger.info(f"Initializing state for {len(wallets)} wallets...")
-    wallet_states = {wallet: [] for wallet in wallets}
+    wallet_states = {wallet: None for wallet in wallets}
     for wallet in wallets:
         positions = fetch_positions_safe(wallet)
         if positions is not None:
@@ -486,6 +486,12 @@ def main():
                         continue
 
                     previous_positions = wallet_states[wallet]
+                    if previous_positions is None:
+                        wallet_states[wallet] = current_positions
+                        logger.info(
+                            f"Initialized {wallet[:8]}... with {len(current_positions)} positions after fetch recovery"
+                        )
+                        continue
                     changes = detect_order_changes(previous_positions, current_positions)
 
                     for change in changes:
