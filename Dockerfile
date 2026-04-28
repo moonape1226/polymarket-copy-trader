@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y nodejs npm && rm -rf /var/lib/apt/lists/*
-RUN npm install -g pmxtjs
+RUN npm install -g pmxtjs@^2.35.18
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

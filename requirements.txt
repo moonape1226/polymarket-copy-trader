@@ -1,7 +1,7 @@
 requests
 ratelimit
 python-dotenv
-pmxt>=2.0.4
+pmxt>=2.35.18
 web3>=7.0.0
 websockets>=13.0
 eth-abi>=4.0.0
