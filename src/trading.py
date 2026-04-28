@@ -45,6 +45,12 @@ _OPEN_SELLS_FIELDS = [
     "market_id", "is_profit", "bs_price", "slug", "initial_position",
     "cost_basis", "bs_sell_tx_hash", "cleared_at", "cleared_reason",
 ]
+_VWAP_SKIPPED_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "vwap_skipped.csv")
+_VWAP_SKIPPED_FIELDS = [
+    "skipped_at", "asset_id", "condition_id", "title",
+    "bs_size", "bs_avg_price", "our_size", "our_vwap_estimate",
+    "bucket", "bucket_tolerance", "reference_source", "skip_reason",
+]
 _MARKET_CACHE_MAXSIZE = 1000
 _RPC_URL = "https://polygon-bor-rpc.publicnode.com"
 _USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
@@ -232,6 +238,168 @@ class TradingModule:
             return self._pending_order_entry_ttl[asset_id]
         meta = self._pending_order_meta.get(asset_id, {})
         return self._buy_entry_ttl_seconds(meta.get("limit_price"))
+
+    def _vwap_bucket_label(self, price: float) -> str:
+        if price < 0.05:
+            return "lt_0_05"
+        if price < 0.15:
+            return "0_05_to_0_15"
+        if price < 0.50:
+            return "0_15_to_0_50"
+        return "gte_0_50"
+
+    def _buy_vwap_tolerance(self, ref_price: Optional[float]) -> float:
+        buckets = self.config.get("buy_vwap_tolerance_by_bucket", {})
+        price = float(ref_price or 0)
+        if price < 0.05:
+            return float(buckets.get("lt_0_05", 0.40))
+        if price < 0.15:
+            return float(buckets.get("0_05_to_0_15", 0.25))
+        if price < 0.50:
+            return float(buckets.get("0_15_to_0_50", 0.15))
+        return float(buckets.get("gte_0_50", 0.05))
+
+    def _fetch_orderbook_asks(self, asset_id: str):
+        """Return ask side as sorted (price, size) list ascending; [] for empty book; None on fetch failure."""
+        try:
+            resp = http_requests.get(
+                "https://clob.polymarket.com/book",
+                params={"token_id": asset_id},
+                timeout=3,
+            )
+            if not resp.ok:
+                return None
+            data = resp.json()
+        except Exception as e:
+            logger.debug(f"Orderbook fetch failed for {asset_id[:12]}: {e}")
+            return None
+        levels = []
+        for a in data.get("asks", []) or []:
+            try:
+                p = float(a.get("price", 0))
+                s = float(a.get("size", 0))
+            except (TypeError, ValueError):
+                continue
+            if p > 0 and s > 0:
+                levels.append((p, s))
+        levels.sort(key=lambda x: x[0])
+        return levels
+
+    def _estimate_buy_vwap(self, asks, target_shares: float):
+        """Walk ascending asks until target filled. Returns (vwap, filled, levels) or None if not fillable."""
+        if not asks or target_shares <= 0:
+            return None
+        cost = 0.0
+        filled = 0.0
+        levels = 0
+        for price, size in asks:
+            levels += 1
+            take = min(size, target_shares - filled)
+            if take <= 0:
+                break
+            cost += take * price
+            filled += take
+            if filled >= target_shares - 1e-9:
+                break
+        if filled <= 0:
+            return None
+        return (cost / filled, filled, levels)
+
+    def _log_vwap_skipped(self, row: Dict[str, Any]):
+        path = os.path.abspath(_VWAP_SKIPPED_CSV)
+        try:
+            with self._csv_lock:
+                write_header = not os.path.exists(path)
+                with open(path, "a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=_VWAP_SKIPPED_FIELDS)
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerow(row)
+        except Exception as e:
+            logger.warning(f"Failed to write vwap_skipped.csv: {e}")
+
+    def _check_vwap_gate(self, trade_change: Dict[str, Any], asset_id: str,
+                         our_size: float, original_size: float, slug: str) -> bool:
+        """Return True if this buy should be skipped due to VWAP/depth tolerance. Spec: docs/copy_trade_optimization_plan.md §2."""
+        if not self.config.get("vwap_gate_enabled", True):
+            return False
+        if trade_change.get('skip_vwap_gate'):
+            return False
+        if trade_change.get('signal_source') == 'reconcile_stale':
+            return False
+        raw_bs_avg = trade_change.get('price')
+        try:
+            has_bs_avg = bool(raw_bs_avg) and float(raw_bs_avg) > 0
+        except (TypeError, ValueError):
+            has_bs_avg = False
+        if has_bs_avg:
+            ref_for_gate = float(raw_bs_avg)
+            ref_source = "bs_avg"
+        else:
+            det = trade_change.get('detection_price')
+            try:
+                ref_for_gate = float(det) if det and float(det) > 0 else None
+            except (TypeError, ValueError):
+                ref_for_gate = None
+            ref_source = "detection_price" if ref_for_gate else None
+        if not ref_for_gate:
+            return False
+        bucket = self._vwap_bucket_label(ref_for_gate)
+        tol = self._buy_vwap_tolerance(ref_for_gate)
+        asks = self._fetch_orderbook_asks(asset_id)
+        log_row = {
+            "skipped_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+            "asset_id": asset_id,
+            "condition_id": trade_change.get('conditionId', ''),
+            "title": trade_change.get('title', ''),
+            "bs_size": original_size,
+            "bs_avg_price": ref_for_gate if ref_source == "bs_avg" else "",
+            "our_size": our_size,
+            "our_vwap_estimate": "",
+            "bucket": bucket,
+            "bucket_tolerance": tol,
+            "reference_source": ref_source,
+            "skip_reason": "",
+        }
+        if asks is None:
+            log_row["skip_reason"] = "no_book"
+            self._log_vwap_skipped(log_row)
+            return False
+        if not asks:
+            log_row["skip_reason"] = "empty_asks"
+            self._log_vwap_skipped(log_row)
+            self._log_copy_decision(trade_change, "SKIPPED_VWAP",
+                                    our_size=our_size, our_cost=None)
+            logger.info(f"VWAP skip (empty_asks): no liquidity — {slug}")
+            return True
+        result = self._estimate_buy_vwap(asks, our_size)
+        if result is None:
+            log_row["skip_reason"] = "empty_asks"
+            self._log_vwap_skipped(log_row)
+            self._log_copy_decision(trade_change, "SKIPPED_VWAP",
+                                    our_size=our_size, our_cost=None)
+            logger.info(f"VWAP skip (empty_asks): no fillable depth — {slug}")
+            return True
+        vwap, filled, _levels = result
+        log_row["our_vwap_estimate"] = round(vwap, 6)
+        max_acceptable = ref_for_gate * (1 + tol)
+        shortfall_pct = float(self.config.get("vwap_max_shortfall_pct", 0.05))
+        if filled < our_size * (1 - shortfall_pct):
+            log_row["skip_reason"] = "book_too_thin"
+        elif vwap > max_acceptable:
+            log_row["skip_reason"] = "vwap_over_tolerance"
+        else:
+            return False
+        self._log_vwap_skipped(log_row)
+        self._log_copy_decision(trade_change, "SKIPPED_VWAP",
+                                our_size=our_size,
+                                our_cost=round(our_size * vwap, 6))
+        logger.info(
+            f"VWAP skip ({log_row['skip_reason']}): vwap {vwap:.4f} vs "
+            f"{ref_source} {ref_for_gate:.4f} +{tol*100:.0f}% "
+            f"(max {max_acceptable:.4f}, filled {filled:.2f}/{our_size:.2f}) — {slug}"
+        )
+        return True
 
     def set_bs_hold_checker(self, checker):
         self._bs_hold_checker = checker
@@ -1064,6 +1232,11 @@ class TradingModule:
                             f"(${our_size * limit_price:.2f} → ${self.low_prob_max_order_usd:.2f} cap)"
                         )
                         our_size = round(max_shares, 2)
+
+            if side == 'buy' and self._check_vwap_gate(trade_change, asset_id,
+                                                       our_size, original_size, slug):
+                return
+
             rate_str = f" [low_prob {effective_copy_pct*100:.1f}%]" if is_low_prob else f" [{effective_copy_pct*100:.1f}%]"
             if limit_price:
                 cost_str = f" limit@{limit_price:.4f} (~${our_size * limit_price:.2f})"
