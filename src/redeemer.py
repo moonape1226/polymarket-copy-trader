@@ -5,6 +5,11 @@ When a market resolves:
   - Winning positions: redeemable for 1 pUSD per share
   - Losing positions: redeemable for 0 pUSD (just clears them from the wallet)
 
+Post-2026-04-28 V2 cutover, users hold wrapped outcome tokens managed by an
+OutcomeTokenFactory (one per market type), not raw CTF positions. Redemption
+goes through the factory's `redeemPositions(_, _, conditionId, indexSets)`,
+which unwraps and forwards to the underlying CTF.
+
 Called periodically from main.py to sweep up any settled positions.
 """
 
@@ -23,48 +28,32 @@ logger = logging.getLogger(__name__)
 # ── Polygon RPC ────────────────────────────────────────────────────────────────
 RPC_URL = "https://polygon-bor-rpc.publicnode.com"
 
-# ── Polymarket contract addresses on Polygon ───────────────────────────────────
-CTF_ADDRESS  = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
-USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+# ── Polymarket V2 outcome token factories on Polygon ──────────────────────────
+# Each factory issues per-market wrapped outcome tokens and redeems them back
+# to pUSD. The first two args of redeemPositions are unused by the factory
+# (kept for legacy CTF call-shape compatibility); we pass zero values.
+OUTCOME_FACTORY_STD = Web3.to_checksum_address("0xADa100874d00e3331D00F2007a9c336a65009718")
+OUTCOME_FACTORY_NEG = Web3.to_checksum_address("0xAdA200001000ef00D07553cEE7006808F895c6F1")
 ZERO_BYTES32   = b"\x00" * 32
 ZERO_ADDRESS   = "0x0000000000000000000000000000000000000000"
 
-_zero_balance_cache: set = set()
+# Caches (conditionId, outcomeIndex) we have already attempted in this process
+# so a single API lag doesn't trigger a stream of revert-only Safe txs.
+_redeem_done_cache: set = set()
 
 # ── Minimal ABIs ───────────────────────────────────────────────────────────────
-CTF_ABI = [
+FACTORY_ABI = [
     {
         "name": "redeemPositions",
         "type": "function",
         "inputs": [
-            {"name": "collateralToken",    "type": "address"},
-            {"name": "parentCollectionId", "type": "bytes32"},
-            {"name": "conditionId",        "type": "bytes32"},
-            {"name": "indexSets",          "type": "uint256[]"},
+            {"name": "_collateral", "type": "address"},   # ignored by V2 factory
+            {"name": "_parent",     "type": "bytes32"},   # ignored by V2 factory
+            {"name": "_conditionId","type": "bytes32"},
+            {"name": "_indexSets",  "type": "uint256[]"},
         ],
         "outputs": [],
         "stateMutability": "nonpayable",
-    },
-    {
-        "name": "getCollectionId",
-        "type": "function",
-        "inputs": [
-            {"name": "parentCollectionId", "type": "bytes32"},
-            {"name": "conditionId",        "type": "bytes32"},
-            {"name": "indexSet",           "type": "uint256"},
-        ],
-        "outputs": [{"type": "bytes32"}],
-        "stateMutability": "view",
-    },
-    {
-        "name": "balanceOf",
-        "type": "function",
-        "inputs": [
-            {"name": "owner", "type": "address"},
-            {"name": "id",    "type": "uint256"},
-        ],
-        "outputs": [{"type": "uint256"}],
-        "stateMutability": "view",
     },
 ]
 
@@ -145,7 +134,6 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
     account = Account.from_key(private_key)
     chain_id = w3.eth.chain_id  # 137
 
-    ctf  = w3.eth.contract(address=CTF_ADDRESS, abi=CTF_ABI)
     safe = w3.eth.contract(address=proxy, abi=SAFE_ABI)
 
     positions = _fetch_redeemable_positions(proxy_address)
@@ -153,7 +141,7 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
         return 0
 
     positions = [p for p in positions
-                 if (p['conditionId'], p.get('outcomeIndex', 0)) not in _zero_balance_cache]
+                 if (p['conditionId'], p.get('outcomeIndex', 0)) not in _redeem_done_cache]
     if not positions:
         return 0
 
@@ -166,26 +154,20 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
         outcome_index = int(pos.get("outcomeIndex", 0))
         title         = pos.get("title", condition_id[:20])
         outcome_label = pos.get("outcome", "")
+        is_neg_risk   = bool(pos.get("negativeRisk"))
 
         # outcomeIndex 0 → YES → indexSet 1  (binary 01)
         # outcomeIndex 1 → NO  → indexSet 2  (binary 10)
         index_set = 1 << outcome_index
+        factory_addr = OUTCOME_FACTORY_NEG if is_neg_risk else OUTCOME_FACTORY_STD
+        factory = w3.eth.contract(address=factory_addr, abi=FACTORY_ABI)
 
         try:
             condition_bytes = _hex_to_bytes(condition_id)
 
-            # Skip if we have no tokens to redeem (API can lag behind on-chain state)
-            collection_id = ctf.functions.getCollectionId(ZERO_BYTES32, condition_bytes, index_set).call()
-            pos_id = int.from_bytes(keccak(bytes.fromhex(USDC_ADDRESS[2:]) + collection_id), "big")
-            balance = ctf.functions.balanceOf(proxy, pos_id).call()
-            if balance == 0:
-                _zero_balance_cache.add((condition_id, outcome_index))
-                logger.info(f"Skipping {title}: already redeemed (balance=0 on-chain)")
-                continue
-
-            # Build redeemPositions calldata
-            calldata = ctf.functions.redeemPositions(
-                USDC_ADDRESS, ZERO_BYTES32, condition_bytes, [index_set]
+            # Build redeemPositions calldata against the V2 factory.
+            calldata = factory.functions.redeemPositions(
+                ZERO_ADDRESS, ZERO_BYTES32, condition_bytes, [index_set]
             ).build_transaction({"gas": 0, "gasPrice": 0, "nonce": 0, "from": proxy})["data"]
             calldata_bytes = _hex_to_bytes(calldata)
 
@@ -193,13 +175,13 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
             nonce = safe.functions.nonce().call()
 
             # Compute Safe tx hash and sign (raw EIP-712 hash, no prefix)
-            tx_hash = _safe_tx_hash(proxy, CTF_ADDRESS, calldata_bytes, nonce, chain_id)
+            tx_hash = _safe_tx_hash(proxy, factory_addr, calldata_bytes, nonce, chain_id)
             sig_obj = Account._sign_hash(tx_hash, private_key)
             signature = sig_obj.signature
 
-            # Build and send execTransaction
+            # Build and send execTransaction targeting the factory
             tx = safe.functions.execTransaction(
-                CTF_ADDRESS, 0, calldata_bytes, 0,
+                factory_addr, 0, calldata_bytes, 0,
                 0, 0, 0,
                 ZERO_ADDRESS,
                 ZERO_ADDRESS,
@@ -211,16 +193,27 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
                 "chainId": chain_id,
             })
 
-            # Estimate gas
-            tx["gas"] = w3.eth.estimate_gas(tx)
+            # Pre-flight: estimate_gas reverts when there is nothing to redeem
+            # (already redeemed, market unresolved, zero wrapped balance). Skip
+            # rather than burn gas on a guaranteed-revert tx.
+            try:
+                tx["gas"] = w3.eth.estimate_gas(tx)
+            except Exception as e:
+                _redeem_done_cache.add((condition_id, outcome_index))
+                logger.info(
+                    f"Skipping {title} ({'neg-risk' if is_neg_risk else 'std'}): "
+                    f"redemption pre-flight failed ({type(e).__name__})"
+                )
+                continue
 
             signed_tx = account.sign_transaction(tx)
             tx_hash_sent = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash_sent, timeout=120)
 
             if receipt.status == 1:
+                _redeem_done_cache.add((condition_id, outcome_index))
                 logger.info(
-                    f"Redeemed: {title} ({outcome_label}) "
+                    f"Redeemed: {title} ({outcome_label}, {'neg-risk' if is_neg_risk else 'std'}) "
                     f"tx={tx_hash_sent.hex()[:16]}..."
                 )
                 redeemed += 1

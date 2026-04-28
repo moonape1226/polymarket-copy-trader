@@ -2,6 +2,8 @@
 
 A bot that tracks one or more Polymarket wallets and mirrors their trades into your own account. Built with [pmxt](https://github.com/pmxt-dev/pmxt).
 
+> **Polymarket V2 (Apr 28 2026)**: this build targets CTF Exchange V2 + pUSD collateral. Order signing goes through `@polymarket/clob-client-v2` inside the pmxt Node sidecar (EIP-712 domain `"2"`); on-chain reads (balance, redemption) target pUSD `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` and the V2 outcome-token factories. Pre-cutover (V1 / USDC.e) deployments will not place orders against the new exchange — pin `pmxt>=2.35.18` and `pmxtjs@^2.35.18`.
+
 Runs as three Docker services sharing a local `data/` volume:
 
 | Service | Purpose |
@@ -20,7 +22,7 @@ Runs as three Docker services sharing a local `data/` volume:
 
 The bot also detects and skips:
 - **Merge operations** — simultaneous YES + NO sell on the same market, not a directional signal
-- **Splits** — simultaneous YES + NO buy at ~$0.50 with equal size (1 USDC = 1 YES + 1 NO)
+- **Splits** — simultaneous YES + NO buy at ~$0.50 with equal size (1 pUSD = 1 YES + 1 NO)
 
 Small orders below the Polymarket $1 minimum are carried forward up to 5 minutes, then discarded.
 
