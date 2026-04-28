@@ -34,12 +34,12 @@ def load_config():
         return json.load(f)
 
 
-def _fetch_recent_activity(wallet: str) -> list:
+def _fetch_recent_activity(wallet: str, limit: int = 50) -> list:
     """Fetch recent TRADE records (both BUY and SELL) from the Polymarket activity API."""
     try:
         resp = requests.get(
             "https://data-api.polymarket.com/activity",
-            params={"user": wallet, "limit": 50},
+            params={"user": wallet, "limit": limit},
             timeout=10,
         )
         resp.raise_for_status()
@@ -149,6 +149,8 @@ def main():
     RECONCILE_STALE_MAX_NOTIONAL = float(
         config.get("reconcile_stale_max_notional", float(config.get("min_trade_usd", 0)) * 2)
     )
+    STARTUP_LOOKBACK_SECONDS = float(config.get("startup_activity_lookback_seconds", 3600))
+    STARTUP_LOOKBACK_LIMIT = int(config.get("startup_activity_lookback_limit", 200))
 
     # Chain-feed aggregation: collect OrderFilled events per (asset, side) and flush
     # after CHAIN_QUIESCE seconds of no new events. Handles multi-fill orders that
@@ -607,6 +609,120 @@ def main():
         for aid in list(reconcile_first_asks):
             if aid not in active_bs_assets:
                 reconcile_first_asks.pop(aid, None)
+
+    def _startup_activity_lookback():
+        """One-shot scan for BS sells that occurred during bot downtime.
+
+        Polling diff baseline is post-restart, so sells executed while the bot
+        was down are invisible to detect_order_changes. This catches the
+        narrow case where BS fully exited an asset we still hold: fetch
+        /activity over a configurable window, filter merges (YES+NO sold in
+        the same tx), and dispatch a full-position sell for each match.
+        Partial sells are out of scope.
+        """
+        if STARTUP_LOOKBACK_SECONDS <= 0:
+            return
+        cutoff = time.time() - STARTUP_LOOKBACK_SECONDS
+        try:
+            our_positions = get_user_positions(proxy_address) or []
+        except Exception as e:
+            logger.warning(f"Startup lookback: fetch our positions failed: {e}")
+            return
+        our_share_map = {p.get("asset"): p for p in our_positions
+                         if p.get("asset") and float(p.get("size", 0)) > 0}
+        if not our_share_map:
+            logger.info("Startup lookback: no proxy holdings, skipping")
+            return
+
+        dispatched = 0
+        for wallet in wallets:
+            bs_state = wallet_states.get(wallet)
+            if bs_state is None:
+                logger.info(f"Startup lookback: {wallet[:8]}… baseline unknown, skipping")
+                continue
+            bs_assets = {p.get("asset") for p in bs_state
+                         if float(p.get("size", 0)) > 0}
+            records = [r for r in _fetch_recent_activity(wallet, limit=STARTUP_LOOKBACK_LIMIT)
+                       if r.get("side", "").upper() == "SELL"
+                       and int(r.get("timestamp", 0)) >= cutoff]
+
+            # Merge filter: a single tx selling both YES and NO of the same
+            # conditionId collapses to USDC, not a directional exit.
+            merge_assets: set = set()
+            by_tx_cid: dict = {}
+            for r in records:
+                tx = (r.get("transactionHash") or r.get("txHash")
+                      or r.get("tx_hash") or r.get("hash"))
+                cid = r.get("conditionId")
+                if tx and cid:
+                    by_tx_cid.setdefault((str(tx), cid), []).append(r)
+            for rows in by_tx_cid.values():
+                outcomes = {(rec.get("outcome") or "").lower() for rec in rows}
+                if {"yes", "no"}.issubset(outcomes):
+                    for rec in rows:
+                        aid = rec.get("asset")
+                        if aid:
+                            merge_assets.add(aid)
+
+            sells_by_asset: dict = {}
+            for r in records:
+                aid = r.get("asset", "")
+                if not aid or aid in merge_assets or aid in bs_assets:
+                    continue
+                if aid not in our_share_map:
+                    continue
+                ts = int(r.get("timestamp", 0))
+                existing = sells_by_asset.get(aid)
+                if existing is None or ts > existing["ts"]:
+                    sells_by_asset[aid] = {"ts": ts, "row": r}
+
+            for aid, info in sells_by_asset.items():
+                row = info["row"]
+                ts = info["ts"]
+                tx_key, key_strength = _activity_tx_key(row, aid, "SELL", ts)
+                if tx_key in trading_module._processed_sell_tx_hashes:
+                    logger.info(
+                        f"Startup lookback: dedup {row.get('title') or aid[:12]} "
+                        f"(tx already processed)"
+                    )
+                    continue
+                our_pos = our_share_map[aid]
+                our_size = float(our_pos.get("size", 0))
+                synth = {
+                    "asset": aid,
+                    "type": "sell",
+                    "size": our_size,
+                    "title": our_pos.get("title") or row.get("title"),
+                    "outcome": our_pos.get("outcome") or row.get("outcome"),
+                    "conditionId": our_pos.get("conditionId") or row.get("conditionId"),
+                    "slug": our_pos.get("slug") or row.get("slug"),
+                    "tx_hash": tx_key,
+                    "tx_key_strength": key_strength,
+                    "signal_source": "startup_lookback",
+                    "signal_received_at": ts,
+                    "detected_at": time.time(),
+                }
+                activity_sells[aid] = {
+                    "ts": ts, "tx_hash": tx_key, "tx_key_strength": key_strength,
+                }
+                recently_dispatched[(aid, "sell")] = time.time()
+                try:
+                    trading_module.update_bs_cost_basis(synth)
+                except Exception as e:
+                    logger.warning(f"update_bs_cost_basis failed for startup lookback: {e}")
+                logger.info(
+                    f"Startup lookback: BS exited '{synth['title']}' "
+                    f"{(time.time()-ts)/60:.1f}m ago — selling {our_size:.2f} sh"
+                )
+                _dispatch(synth)
+                dispatched += 1
+
+        if dispatched:
+            logger.info(f"Startup lookback: dispatched {dispatched} missed sell(s)")
+        else:
+            logger.info("Startup lookback: no missed sells in window")
+
+    _startup_activity_lookback()
 
     try:
         while True:
