@@ -39,6 +39,12 @@ _ORDER_METRICS_FIELDS = [
     "submit_ack_at", "fill_confirmed_at", "confirmed_by", "our_size",
     "limit_price", "fill_cost", "placed_at", "expires_at", "bs_holds_at_expiry",
 ]
+_OPEN_SELLS_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "open_sells.csv")
+_OPEN_SELLS_FIELDS = [
+    "timestamp", "event", "asset_id", "order_id", "placed_at", "ttl", "shares",
+    "market_id", "is_profit", "bs_price", "slug", "initial_position",
+    "cost_basis", "bs_sell_tx_hash", "cleared_at", "cleared_reason",
+]
 _MARKET_CACHE_MAXSIZE = 1000
 _RPC_URL = "https://polygon-bor-rpc.publicnode.com"
 _USDC_ADDRESS = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
@@ -125,6 +131,7 @@ class TradingModule:
         self._server_manager = _sm.ServerManager()
         logger.info("Connected.")
         self._cancel_orphan_open_orders()
+        self._rehydrate_open_sells()
 
     def _cancel_orphan_open_orders(self):
         # Bot rebuild wipes _pending_order_ids but CLOB retains the orders.
@@ -247,6 +254,102 @@ class TradingModule:
                 if write_header:
                     writer.writeheader()
                 writer.writerow(row)
+
+    def _append_open_sell_event(self, event: str, asset_id: str, order_id: str,
+                                meta: Optional[dict] = None, reason: str = ""):
+        meta = meta or {}
+        now = time.time()
+        row = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(now)),
+            "event": event,
+            "asset_id": asset_id,
+            "order_id": order_id,
+            "placed_at": meta.get("placed_at", ""),
+            "ttl": meta.get("ttl", ""),
+            "shares": meta.get("shares", ""),
+            "market_id": meta.get("market_id", ""),
+            "is_profit": meta.get("is_profit", ""),
+            "bs_price": meta.get("bs_price", ""),
+            "slug": meta.get("slug", ""),
+            "initial_position": meta.get("initial_position", ""),
+            "cost_basis": meta.get("cost_basis", ""),
+            "bs_sell_tx_hash": meta.get("bs_sell_tx_hash", ""),
+            "cleared_at": now if event == "cleared" else "",
+            "cleared_reason": reason,
+        }
+        path = os.path.abspath(_OPEN_SELLS_CSV)
+        try:
+            with self._csv_lock:
+                write_header = not os.path.exists(path)
+                with open(path, "a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=_OPEN_SELLS_FIELDS)
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerow(row)
+        except Exception as e:
+            logger.warning(f"Failed to write open_sells.csv: {e}")
+
+    def _rehydrate_open_sells(self):
+        path = os.path.abspath(_OPEN_SELLS_CSV)
+        if not os.path.exists(path):
+            return
+        active: Dict[str, dict] = {}
+        try:
+            with open(path, newline="") as f:
+                for row in csv.DictReader(f):
+                    oid = row.get("order_id", "")
+                    if not oid:
+                        continue
+                    if row.get("event") == "placed":
+                        active[oid] = row
+                    elif row.get("event") == "cleared":
+                        active.pop(oid, None)
+        except Exception as e:
+            logger.warning(f"Open-sell rehydrate: failed reading open_sells.csv: {e}")
+            return
+        if not active:
+            return
+        try:
+            open_orders = {o.id: o for o in self.poly.fetch_open_orders()}
+        except Exception as e:
+            logger.warning(f"Open-sell rehydrate: fetch_open_orders failed: {e}")
+            return
+        imported = 0
+        cleared = 0
+        for oid, row in active.items():
+            order = open_orders.get(oid)
+            aid = row.get("asset_id", "")
+            if not order or str(order.side).lower() != "sell" or not aid:
+                self._append_open_sell_event("cleared", aid, oid, reason="missing_on_startup")
+                cleared += 1
+                continue
+            try:
+                placed_at = float(row.get("placed_at") or time.time())
+                ttl = float(row.get("ttl") or 60)
+                shares = float(row.get("shares") or order.size)
+                initial_position = float(row.get("initial_position") or shares)
+                bs_price = float(row.get("bs_price") or 0)
+                cost_basis = float(row.get("cost_basis") or 0)
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Open-sell rehydrate: bad row for {oid[:16]}: {e}")
+                continue
+            self._pending_sell_ids[aid] = oid
+            self._pending_sell_times[aid] = placed_at
+            self._pending_sell_meta[aid] = {
+                "shares": shares,
+                "ttl": ttl,
+                "bs_price": bs_price,
+                "slug": row.get("slug") or aid[:12],
+                "market_id": row.get("market_id", ""),
+                "is_profit": row.get("is_profit", "False").strip().lower() == "true",
+                "cost_basis": cost_basis,
+                "initial_position": initial_position,
+                "placed_at": placed_at,
+                "bs_sell_tx_hash": row.get("bs_sell_tx_hash", ""),
+            }
+            imported += 1
+        if imported or cleared:
+            logger.info(f"Open-sell rehydrate: imported {imported}, cleared {cleared} stale row(s)")
 
     def _log_bot_trade(self, side: str, trade_change: Dict[str, Any],
                        our_shares: float, our_cost: float,
@@ -600,6 +703,7 @@ class TradingModule:
                 continue
             oid = self._pending_sell_ids.get(aid)
             slug = meta.get("slug", aid[:12])
+            clear_reason = "ttl_expired"
             try:
                 if oid:
                     try:
@@ -629,11 +733,16 @@ class TradingModule:
                             side="sell", amount=remaining,
                             order_type="market", price=None,
                         )
+                        clear_reason = "ttl_market_fallback"
                     except Exception as e:
                         logger.error(f"Sell TTL market fallback failed for {slug}: {e}")
+                        clear_reason = "ttl_market_fallback_failed"
                 else:
                     logger.info(f"Maker sell TTL expired — fully filled or no remainder for {slug}")
+                    clear_reason = "filled_or_no_remainder"
             finally:
+                if oid:
+                    self._append_open_sell_event("cleared", aid, oid, meta, clear_reason)
                 self._pending_sell_ids.pop(aid, None)
                 self._pending_sell_times.pop(aid, None)
                 self._pending_sell_meta.pop(aid, None)
@@ -885,14 +994,20 @@ class TradingModule:
                         logger.warning(f"Maker sell failed, falling back to market: {e}")
                     else:
                         oid = order.get('id', '')
+                        placed_at = time.time()
                         self._pending_sell_ids[asset_id] = oid
-                        self._pending_sell_times[asset_id] = time.time()
+                        self._pending_sell_times[asset_id] = placed_at
                         self._pending_sell_meta[asset_id] = {
                             "shares": our_size, "ttl": ttl, "bs_price": bs_sell_price,
                             "slug": slug, "market_id": market_id,
                             "is_profit": is_profit, "cost_basis": bs_avg,
                             "initial_position": float(our_positions[asset_id].size),
+                            "placed_at": placed_at,
+                            "bs_sell_tx_hash": trade_change.get("tx_hash") or trade_change.get("transactionHash") or "",
                         }
+                        self._append_open_sell_event(
+                            "placed", asset_id, oid, self._pending_sell_meta[asset_id]
+                        )
                         logger.info(
                             f"Maker sell @ ${maker_limit:.4f} "
                             f"({'profit' if is_profit else 'loss'} exit, "
