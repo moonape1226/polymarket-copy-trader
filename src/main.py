@@ -147,6 +147,7 @@ def main():
     recently_dispatched: dict = {}  # (asset_id, side) → dispatch ts; per-side so a
                                     # chain BUY doesn't silence polling's SELL detection
                                     # when BS flips the same asset within CHAIN_DEDUP_TTL.
+    recent_dispatch_sources: dict = {}  # (asset_id, side) → signal_source for dispatch-level dedup
     RECONCILE_MAX_AGE = float(config.get("reconcile_max_age_seconds", 960))  # 16 minutes
     RECONCILE_STALE_SECONDS = float(config.get("reconcile_stale_seconds", 60))
     RECONCILE_STALE_PRICE_DRIFT_PCT = float(config.get("reconcile_stale_price_drift_pct", 0.05))
@@ -162,17 +163,12 @@ def main():
     # after CHAIN_QUIESCE seconds of no new events. Handles multi-fill orders that
     # emit several OrderFilled logs within the same tx.
     chain_pending: dict = {}  # (asset, side) → {size, price_wsum, usd_sum, first_ts, last_ts, tx_hashes, wallet}
-    # 1.0s aggregates BS multi-fill bursts within a single tx (logs arrive
-    # microseconds apart) and tolerates dust+main fills up to ~800ms apart.
-    # Earlier value 0.7s clipped some multi-fill sequences: when the dust
-    # fill flushed alone, copy filters dropped it (below min_trade_usd), and
-    # the main fill arriving >700ms later was then suppressed by the
-    # _dispatch dedup gate — under-copy. 1.0s keeps most of the latency win
-    # over the original 1.5s default while restoring aggregation margin.
-    # Pending-cost cap math already counts unfilled orders
-    # (trading.py:_refresh_exposure), so flushes can't bypass max_position_usd.
-    CHAIN_QUIESCE = float(config.get("chain_quiesce_seconds", 1.0))
+    # Keep 1.5s until multi-fill tests prove a lower value won't split one BS
+    # tx into separate buckets. Split buckets can under-copy when buy tx
+    # idempotency treats the later bucket as already processed.
+    CHAIN_QUIESCE = float(config.get("chain_quiesce_seconds", 1.5))
     CHAIN_DEDUP_TTL = 300  # seconds: /positions detection is suppressed this long after chain dispatch
+    CROSS_SOURCE_DISPATCH_DEDUP_TTL = float(config.get("cross_source_dispatch_dedup_seconds", 15))
     BS_SELL_REBUY_COOLOFF = 60  # seconds: upper bound on /positions lag vs chain feed
 
     # Independent metadata cache for chain-path lookups. Does NOT write to
@@ -201,30 +197,33 @@ def main():
                 result = trading_module.execute_copy_trade(synth)
                 if result is False:
                     recently_dispatched.pop((aid, side), None)
+                    recent_dispatch_sources.pop((aid, side), None)
             except Exception as e:
                 recently_dispatched.pop((aid, side), None)
+                recent_dispatch_sources.pop((aid, side), None)
                 logger.error(f"execute_copy_trade failed for {aid[:12]}…: {e}")
 
     def _dispatch(synth: dict):
-        # Single-source dedup gate: synchronously record the dispatch before
-        # handing the trade to the executor so every signal path (chain feed,
-        # WS fast-lane, /activity flush, batch flush, reconcile, startup
-        # lookback) sees a consistent `recently_dispatched` view. Without this,
-        # WS fast-lane (~2s) could fire on a pending entry that polling created
-        # before chain feed also fired on the same on-chain event, producing
-        # ~2× copy_pct exposure. _run_trade still pops the key on failure to
-        # allow retry.
+        # Cross-source dedup gate: record before executor handoff so WS,
+        # activity, batch, reconcile, startup lookback, and chain see the same
+        # recent-dispatch view. Chain→chain is allowed because separate chain
+        # buckets can be legitimate multi-fill continuation; buy tx idempotency
+        # handles exact tx duplicates after execution.
         aid = synth.get("asset", "")
         side = (synth.get("type") or "").lower()
+        source = synth.get("signal_source", "")
         rd_ts = recently_dispatched.get((aid, side))
-        if rd_ts is not None and (time.time() - rd_ts) < CHAIN_DEDUP_TTL:
+        rd_source = recent_dispatch_sources.get((aid, side), "")
+        if (rd_ts is not None and (time.time() - rd_ts) < CROSS_SOURCE_DISPATCH_DEDUP_TTL
+                and (source != "chain" or rd_source != "chain")):
             logger.info(
                 f"Dispatch suppressed (dedup): {side.upper()} {aid[:12]}… "
                 f"already dispatched {time.time() - rd_ts:.1f}s ago "
-                f"(source={synth.get('signal_source','?')})"
+                f"(source={source or '?'}, prior={rd_source or '?'})"
             )
             return
         recently_dispatched[(aid, side)] = time.time()
+        recent_dispatch_sources[(aid, side)] = source
         executor.submit(_run_trade, synth)
 
     def _metadata_from_states(asset_id: str) -> dict:
@@ -488,6 +487,7 @@ def main():
         for k in list(recently_dispatched.keys()):
             if (now_ts - recently_dispatched[k]) >= CHAIN_DEDUP_TTL:
                 recently_dispatched.pop(k, None)
+                recent_dispatch_sources.pop(k, None)
         # Reconcile only handles missed BUYs, so check the buy-side key.
         try:
             our_positions = get_user_positions(proxy_address) or []
@@ -897,6 +897,7 @@ def main():
                         "price": avg_price, "size": shares,
                     })
                 hedged_fast_cids: set = set()
+                ambiguous_fast_cids: set = set()
                 for cid, sides in cid_buy_info.items():
                     if "yes" in sides and "no" in sides:
                         yes_p, no_p = sides["yes"]["price"], sides["no"]["price"]
@@ -906,6 +907,10 @@ def main():
                                 and abs(no_p - 0.5) <= FL_PRICE_TOL
                                 and size_ratio <= FL_SIZE_TOL):
                             hedged_fast_cids.add(cid)
+                    elif len(sides) == 1:
+                        only = next(iter(sides.values()))
+                        if abs(only["price"] - 0.5) <= FL_PRICE_TOL:
+                            ambiguous_fast_cids.add(cid)
 
                 for asset_id in list(pending.keys()):
                     p = pending[asset_id]
@@ -924,6 +929,12 @@ def main():
                             f"({cid[:12]}…)"
                         )
                         pending.pop(asset_id, None)
+                        continue
+                    if cid and cid in ambiguous_fast_cids:
+                        logger.info(
+                            f"WS fast-lane hold possible split: {p['meta'].get('title')} "
+                            f"({cid[:12]}…)"
+                        )
                         continue
                     synthetic = dict(p["meta"])
                     synthetic["type"] = "buy"
