@@ -26,5 +26,11 @@
     "market_order_gap_threshold": 1.05,
     "unknown_price_max_ask": 0.15,
     "sell_maker_ttl_profit_seconds": 120,
-    "sell_maker_ttl_loss_seconds": 15
+    "sell_maker_ttl_loss_seconds": 15,
+    "buy_entry_ttl_seconds_by_bucket": {
+        "lt_0_05": 90,
+        "0_05_to_0_15": 60,
+        "0_15_to_0_50": 45,
+        "gte_0_50": 30
+    }
 }
