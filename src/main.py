@@ -428,6 +428,39 @@ def main():
                     )
                     skip_chain_keys.update([yes["key"], no["key"]])
 
+            # Convert detection (V2 NegRiskAdapter convertPositions): same
+            # condition, opposite sides, opposite outcomes, sharing at least
+            # one tx_hash. /activity API hides the protocol-generated mirror
+            # leg and only reports the user-visible side, so dispatching the
+            # raw chain events double-counts and creates ghost positions on
+            # the wrong outcome. Skip both legs and let polling pick up the
+            # /activity-visible side normally.
+            buy_yes_o = sides.get("buy", {}).get("yes")
+            buy_no_o  = sides.get("buy", {}).get("no")
+            sell_yes_o = sides.get("sell", {}).get("yes")
+            sell_no_o  = sides.get("sell", {}).get("no")
+            for label_pair, leg_a, leg_b in (
+                ("buy_no+sell_yes", buy_no_o,  sell_yes_o),
+                ("buy_yes+sell_no", buy_yes_o, sell_no_o),
+            ):
+                if not leg_a or not leg_b:
+                    continue
+                ba = chain_pending.get(leg_a["key"])
+                bb = chain_pending.get(leg_b["key"])
+                if not ba or not bb:
+                    continue
+                if not (ba.get("tx_hashes") and bb.get("tx_hashes")
+                        and ba["tx_hashes"] & bb["tx_hashes"]):
+                    continue
+                logger.info(
+                    f"Chain skip convert ({label_pair}) on "
+                    f"{leg_a.get('title') or cid[:12]+'…'}: legs "
+                    f"{leg_a['size']:.2f}@${leg_a['price']:.4f} / "
+                    f"{leg_b['size']:.2f}@${leg_b['price']:.4f} share tx; "
+                    f"/activity-visible side will be picked up by polling"
+                )
+                skip_chain_keys.update([leg_a["key"], leg_b["key"]])
+
         for key in ready_keys:
             b = chain_pending.get(key)
             if b is None:
