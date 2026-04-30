@@ -59,3 +59,19 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  book-logger:
+    container_name: polymarket-book-logger
+    build:
+      context: ./book_logger
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./data:/data
+    environment:
+      - BOOK_LOGGER_DATA_DIR=/data/book_logger
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
