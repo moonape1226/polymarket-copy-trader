@@ -11,6 +11,7 @@
     "low_prob_min_trade_usd": 0,
     "low_prob_max_portfolio_pct": 0.20,
     "low_prob_max_order_usd": 150,
+    "reconcile_stale_max_notional": 30,
     "trading_enabled": true,
     "max_buy_price": 0.99,
     "blocked_title_keywords": ["taiwan"],
