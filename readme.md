@@ -10,7 +10,6 @@ Runs as three Docker services sharing a local `data/` volume:
 |---|---|
 | `copy-trader` | Polls target wallets, detects trades, executes copies |
 | `market-scanner` | Scans for high-probability markets every 6h, posts to Slack |
-| `trade-logger` | Logs raw activity for observed wallets to per-wallet CSVs |
 
 ## How it works
 
@@ -73,7 +72,6 @@ docker compose exec copy-trader python3 test_auth.py
 | Key | Default | Description |
 |-----|---------|-------------|
 | `wallets_to_track` | `[]` | Wallet addresses the bot actively copies |
-| `wallets_to_observe` | `{}` | `{name: address}` map logged by trade-logger (no copying) |
 | `copy_percentage` | `1.0` | Fraction of the tracked trader's size to copy (e.g. `0.5` = 50%) |
 | `trading_enabled` | `false` | Set to `true` to place real orders; `false` for dry-run logging only |
 | `batch_window_seconds` | `180` | Seconds to accumulate changes before executing the net trade |
@@ -101,13 +99,10 @@ Outcomes priced below `low_prob_price_threshold` are treated as a separate tier 
 # Live logs
 docker compose logs -f copy-trader
 docker compose logs -f polymarket-scanner
-docker compose logs -f polymarket-logger
 
 # Bot trade history
 cat data/bot_trades.csv
 
-# Per-wallet observed activity (trade-logger output)
-cat data/observe_<WalletName>.csv
 
 # Scanner calibration history
 cat data/scan_history.json

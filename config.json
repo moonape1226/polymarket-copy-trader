@@ -2,10 +2,7 @@
     "wallets_to_track": [
         "0x331bf91c132af9d921e1908ca0979363fc47193f"
     ],
-    "wallets_to_observe": {
-        "sovereign2013": "0xee613b3fc183ee44f9da9c05f53e2da107e3debf"
-    },
-    "copy_percentage": 1.0,
+"copy_percentage": 1.0,
     "low_prob_copy_percentage": 1.0,
     "low_prob_price_threshold": 0.30,
     "low_prob_min_trade_usd": 0,

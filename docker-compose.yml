@@ -30,20 +30,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  trade-logger:
-    container_name: polymarket-logger
-    build:
-      context: ./tracker
-    restart: unless-stopped
-    volumes:
-      - ./config.json:/app/config.json:ro
-      - ./data:/data
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
   weather-predictor:
     container_name: polymarket-weather
     build:
@@ -70,6 +56,21 @@ services:
       - ./data:/data
     environment:
       - BOOK_LOGGER_DATA_DIR=/data/book_logger
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  weather-audit:
+    container_name: polymarket-weather-audit
+    build:
+      context: ./audit
+    restart: unless-stopped
+    environment:
+      - DATA_DIR=/data
+    volumes:
+      - ./data:/data
     logging:
       driver: json-file
       options:
