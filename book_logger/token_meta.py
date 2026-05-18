@@ -40,6 +40,13 @@ class _TokenMetaCache:
         self._misses: Dict[str, float] = {}
         self._load_from_disk()
 
+    def _prune_misses(self, now: float) -> None:
+        """Drop miss entries past their retry TTL — they'd be retried anyway,
+        so keeping them only grows memory unbounded. Caller holds _lock."""
+        stale = [k for k, ts in self._misses.items() if now - ts >= _MISS_RETRY_S]
+        for k in stale:
+            self._misses.pop(k, None)
+
     def _load_from_disk(self) -> None:
         if not os.path.exists(_PERSIST_PATH):
             return
@@ -81,11 +88,13 @@ class _TokenMetaCache:
             if not r.ok:
                 with self._lock:
                     self._misses[asset_id] = now
+                    self._prune_misses(now)
                 return None
             data = r.json()
             if not isinstance(data, list) or not data:
                 with self._lock:
                     self._misses[asset_id] = now
+                    self._prune_misses(now)
                 return None
             m = data[0]
             outcomes_raw = m.get("outcomes")

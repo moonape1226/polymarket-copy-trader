@@ -13,7 +13,10 @@ Criteria:
   - Probability: 80-97%
   - Days to expiry: <= 7
   - Volume: > $5K, Liquidity: > $3K
-  - Excludes crypto price markets, novelty markets, sports, esports
+  - Excludes sports & esports (tag + title heuristic) and a small novelty
+    title blocklist. Crypto-price markets (e.g. "Bitcoin above $X") are
+    intentionally INCLUDED — they are the bulk of the high-prob near-term
+    signal and the calibration history depends on them.
 """
 
 import json
@@ -92,12 +95,34 @@ def classify_topic(text: str) -> str:
 RESOLVED_RETENTION_DAYS = 30
 
 
+_HISTORY_BAK = HISTORY_FILE.with_suffix(".json.bak")
+
+
+def _load_json_list(path: Path) -> list | None:
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        logger.warning(f"load_history: {path} unreadable/corrupt: {e}")
+        return None
+    if not isinstance(data, list):
+        logger.warning(f"load_history: {path} is not a list ({type(data).__name__})")
+        return None
+    return data
+
+
 def load_history() -> list:
     if HISTORY_FILE.exists():
-        try:
-            return json.loads(HISTORY_FILE.read_text())
-        except Exception:
-            pass
+        data = _load_json_list(HISTORY_FILE)
+        if data is not None:
+            return data
+        # main file corrupt — recover from last good backup before the
+        # caller's save_history() would otherwise overwrite it with []
+        if _HISTORY_BAK.exists():
+            data = _load_json_list(_HISTORY_BAK)
+            if data is not None:
+                logger.warning("load_history: recovered calibration from .bak")
+                return data
+        logger.error("load_history: no recoverable history; starting empty")
     return []
 
 
@@ -108,7 +133,19 @@ def save_history(records: list):
         if not r.get("resolved") or r.get("expiry_ts", 0) > cutoff
     ]
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    HISTORY_FILE.write_text(json.dumps(records, indent=2))
+    # keep the previous good file as .bak, then write atomically so a crash
+    # or disk-full mid-write cannot truncate scan_history.json (P3)
+    if HISTORY_FILE.exists():
+        try:
+            os.replace(HISTORY_FILE, _HISTORY_BAK)
+        except OSError as e:
+            logger.warning(f"save_history: could not refresh .bak: {e}")
+    tmp = HISTORY_FILE.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(records, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, HISTORY_FILE)
 
 
 # ── API ───────────────────────────────────────────────────────────────────────
@@ -117,7 +154,9 @@ def fetch_events() -> list:
     all_events = []
     offset = 0
     batch_size = 100  # gamma-api hard-caps /events at 100/page regardless of limit
-    for _ in range(40):  # 40×100 keeps the prior ~4000-event depth
+    pages = 40  # 40×100 keeps the prior ~4000-event depth
+    hit_cap = True
+    for _ in range(pages):
         for attempt in range(3):
             try:
                 resp = requests.get(
@@ -135,12 +174,21 @@ def fetch_events() -> list:
                 time.sleep(10)
         batch = resp.json()
         if not isinstance(batch, list) or not batch:
+            hit_cap = False
             break
         all_events.extend(batch)
         if len(batch) < batch_size:
+            hit_cap = False
             break
         offset += batch_size
         time.sleep(0.3)
+    if hit_cap:
+        # Exhausted the page budget before reaching the end of the active set —
+        # lower-volume but still-eligible near-term markets may be unseen (#120)
+        logger.warning(
+            f"fetch_events: hit {pages}-page cap ({len(all_events)} events); "
+            f"tail of active set not scanned"
+        )
     return all_events
 
 
@@ -163,8 +211,12 @@ def fetch_market(condition_id: str, market_id: str = "") -> dict | None:
             return data[0]
         if isinstance(data, dict):
             return data
-    except Exception:
-        pass
+    except Exception as e:
+        # Distinguish API/network/schema failure from "market not found" so a
+        # stalled calibration is visible instead of silent (P2).
+        logger.warning(
+            f"fetch_market failed (cid={condition_id[:10]} mid={market_id}): {e}"
+        )
     return None
 
 
@@ -190,7 +242,16 @@ def check_resolutions(history: list) -> tuple[list, int]:
             outcomes = json.loads(market.get("outcomes", "[]"))
         except Exception:
             continue
-        if not prices or max(prices) < 0.99:
+        if not prices:
+            continue
+        # Prefer explicit resolution flags; fall back to the price heuristic so
+        # a resolved market with a stale/non-0.99 price is not missed (#185).
+        resolved_flag = (
+            bool(market.get("closed"))
+            or market.get("umaResolutionStatus") == "resolved"
+            or market.get("resolved") is True
+        )
+        if not resolved_flag and max(prices) < 0.99:
             continue  # not yet resolved to binary
         winner_idx = prices.index(max(prices))
         winner = outcomes[winner_idx] if winner_idx < len(outcomes) else "?"
@@ -266,16 +327,26 @@ def event_correct_stats(history: list):
             f"    {topic:10}  {ts['events']:2d} events / {ts['markets']:3d} markets  [resolved {wr}]"
         )
 
-    by_event = {ev: [r for r in rs if r.get("resolved")]
-                for ev, rs in all_by_event.items()
-                if any(r.get("resolved") for r in rs)}
-    if not by_event:
+    # Only score events where EVERY tracked market has resolved. Previously
+    # unresolved siblings were dropped, so a 2-of-5-resolved event could be
+    # reported as "fully correct" prematurely (#269).
+    complete = {ev: rs for ev, rs in all_by_event.items()
+                if rs and all(r.get("resolved") for r in rs)}
+    partial_n = sum(1 for ev, rs in all_by_event.items()
+                    if any(r.get("resolved") for r in rs)
+                    and not all(r.get("resolved") for r in rs))
+    if not complete:
+        if partial_n:
+            logger.info(f"── Event-level: 0 complete events ({partial_n} partial, not scored)")
         return
 
-    events = [(ev, rs, all(r.get("correct") for r in rs)) for ev, rs in by_event.items()]
+    events = [(ev, rs, all(r.get("correct") for r in rs)) for ev, rs in complete.items()]
     ok = sum(1 for _, _, c in events if c)
     total = len(events)
-    logger.info(f"── Event-level: {ok}/{total} events fully correct ({ok/total*100:.1f}%)")
+    logger.info(
+        f"── Event-level: {ok}/{total} complete events fully correct "
+        f"({ok/total*100:.1f}%); {partial_n} partial event(s) not yet scored"
+    )
 
     single = [(ev, rs, c) for ev, rs, c in events if len(rs) == 1]
     bucket = [(ev, rs, c) for ev, rs, c in events if len(rs) > 1]
@@ -312,6 +383,7 @@ def scan(history: list) -> list:
 
     # First pass: collect all qualifying markets per event
     event_candidates: dict = {}
+    parse_skipped = 0
 
     for event in events:
         title = event.get("title", "")
@@ -368,8 +440,15 @@ def scan(history: list) -> list:
                     }
                 event_candidates[event_slug]["markets"].append(entry)
                 event_candidates[event_slug]["days"] = min(event_candidates[event_slug]["days"], days)
-            except Exception:
+            except Exception as e:
+                # schema variation / bad date / non-JSON field — count so a
+                # systematic gamma change is visible, not silently dropped (#330)
+                parse_skipped += 1
+                if parse_skipped <= 3:
+                    logger.warning(f"scan: skipped market parse: {type(e).__name__}: {e}")
                 continue
+    if parse_skipped:
+        logger.warning(f"scan: {parse_skipped} market(s) skipped on parse this cycle")
 
     # Second pass: per event keep top MAX_MARKETS_PER_EVENT by liquidity,
     # add new ones to history, determine notification eligibility
@@ -459,6 +538,14 @@ def scan(history: list) -> list:
                 f"${m['liq']/1000:.0f}K liq  [{m['side']}]  {m['question']}{tag}"
             )
     logger.info(f"{'='*80}")
+
+    # Actually deliver the alert — previously _send_slack was never called so
+    # new/updated markets only ever hit the log (dead alert path).
+    if SLACK_WEBHOOK:
+        try:
+            _send_slack(events_list)
+        except Exception as e:
+            logger.warning(f"Slack send failed: {e}")
 
     return history
 

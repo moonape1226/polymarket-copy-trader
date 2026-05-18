@@ -42,6 +42,7 @@ logger = logging.getLogger("predictor")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DECISIONS_CSV = DATA_DIR / "paper_decisions.csv"
+_DECISIONS_MAX_BYTES = 256 * 1024 * 1024  # rotate at 256 MB (caps disk ~512 MB)
 POSITIONS_JSON = DATA_DIR / "paper_positions.json"
 SETTLED_CSV = DATA_DIR / "paper_settled.csv"
 
@@ -78,14 +79,17 @@ _recent_stops: dict[str, float] = {}
 # anchored on NOAA NDFD max-temperature verification (MAE) at typical forecast
 # lead times, converted via σ ≈ MAE × 1.25 (Gaussian approximation).
 # Reference: https://verification.nws.noaa.gov  (NDFD MaxT verification stats).
-# These should be replaced with empirical σ per (city, lead_hours) once
-# settlement data accumulates from paper-trade results.
-_EMPIRICAL_SIGMA: float | None = None  # set at startup from settled RESOLVE residuals
+# Per-kind empirical {bias, sigma} loaded at startup from calibration.json (preferred).
+_KIND_CALIBRATION: dict[str, dict[str, float]] = {}
+# "{city}|{kind}" -> mean residual. Overrides per-kind bias when present;
+# city is a stronger conditioning axis than lead time (Miami lowest ~+1.6°F
+# warm, NYC lowest ~+0.6°F). Loaded from calibration.json per_city_kind.
+_CITY_KIND_BIAS: dict[str, float] = {}
 
 
-def sigma_for_hours(h: float | None) -> float:
-    if _EMPIRICAL_SIGMA is not None:
-        return _EMPIRICAL_SIGMA
+def sigma_for_hours(h: float | None, kind: str | None = None) -> float:
+    if kind is not None and kind in _KIND_CALIBRATION:
+        return _KIND_CALIBRATION[kind]["sigma"]
     if h is None:
         base = 3.0
     elif h <= 2:   base = 1.2
@@ -95,6 +99,21 @@ def sigma_for_hours(h: float | None) -> float:
     elif h <= 24:  base = 3.5
     else:          base = 4.5
     return base * SIGMA_INFLATION
+
+
+def bias_for_kind(kind: str) -> float:
+    """Per-kind mean residual (actual − t_hat) from calibration.json. 0 if absent."""
+    return _KIND_CALIBRATION.get(kind, {}).get("bias", 0.0)
+
+
+def bias_for(city: str, kind: str) -> float:
+    """Bias correction for this (city, kind). Prefers the per-(city, kind)
+    mean residual (needs n≥8 in calibration); falls back to the pooled per-kind
+    bias when the city has too few samples."""
+    cb = _CITY_KIND_BIAS.get(f"{city}|{kind}")
+    if cb is not None:
+        return cb
+    return bias_for_kind(kind)
 MAX_PER_BUCKET_USD = 150.0              # single prediction cap
 MAX_PER_MARKET_USD = 500.0              # all buckets in one market_date_city
 PAPER_STARTING_CAPITAL = 10_000.0       # informational only
@@ -275,8 +294,15 @@ def nws_fetch_observations(station: str, start_iso: str, end_iso: str) -> list[d
         params={"start": start_iso, "end": end_iso},
     )
     if not j:
+        # Distinguish a failed/empty fetch from "no observations yet" so a
+        # broken NWS endpoint is visible instead of silently retried (#11)
+        logger.warning(
+            "nws observations: no data for %s [%s→%s] (fetch failed or empty)",
+            station, start_iso, end_iso,
+        )
         return []
     out: list[dict] = []
+    skipped = 0
     for f in j.get("features", []) or []:
         try:
             props = f.get("properties", {})
@@ -286,7 +312,10 @@ def nws_fetch_observations(station: str, start_iso: str, end_iso: str) -> list[d
                 continue
             out.append({"ts": ts, "temperature_f": float(t) * 9.0 / 5.0 + 32.0})
         except Exception:
+            skipped += 1
             continue
+    if skipped:
+        logger.warning("nws observations: %d malformed record(s) for %s", skipped, station)
     return out
 
 
@@ -377,10 +406,10 @@ def fetch_weather_events() -> list[dict]:
     Filters past-end events and dedups by event id."""
     seen_ids: set = set()
     out: list[dict] = []
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
     offset = 0
-    batch = 200
-    for _ in range(20):
+    batch = 100
+    for _ in range(40):
         try:
             r = requests.get(
                 f"{GAMMA}/events",
@@ -407,8 +436,15 @@ def fetch_weather_events() -> list[dict]:
             if ev_id in seen_ids:
                 continue
             end = ev.get("endDate") or ""
-            if end and end < now_iso:
-                continue
+            if end:
+                # Parse to an aware datetime — lexicographic ISO compare is
+                # wrong across 'Z' vs '+00:00' and microsecond differences (#9)
+                try:
+                    end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                    if end_dt < now_dt:
+                        continue
+                except ValueError:
+                    pass
             title_lc = (ev.get("title") or "").lower()
             if "temperature" not in title_lc:
                 continue
@@ -505,9 +541,16 @@ def normal_cdf(x: float, mu: float, sigma: float) -> float:
 
 
 def bucket_prob(t_hat: float, sigma: float, lo: float | None, hi: float | None) -> float:
-    """Prob that realized temp lands in [lo, hi]. None lo = -inf, None hi = +inf."""
-    cdf_hi = 1.0 if hi is None else normal_cdf(hi, t_hat, sigma)
-    cdf_lo = 0.0 if lo is None else normal_cdf(lo, t_hat, sigma)
+    """Prob the integer-rounded realized temp lands in the bucket.
+
+    Polymarket weather buckets are integer-Fahrenheit inclusive: label "67-68"
+    settles if the official integer daily extreme is 67 or 68; tails "<=N"/">=N"
+    are inclusive. To match that under a continuous Gaussian, widen each bound by
+    half a degree so adjacent buckets tile [-inf, +inf) with no gap/overlap:
+    "A-B" -> [A-0.5, B+0.5), "<=N" -> (-inf, N+0.5), ">=N" -> [N-0.5, +inf).
+    Must stay consistent with settle_positions' rounding rule (C2)."""
+    cdf_hi = 1.0 if hi is None else normal_cdf(hi + 0.5, t_hat, sigma)
+    cdf_lo = 0.0 if lo is None else normal_cdf(lo - 0.5, t_hat, sigma)
     return max(0.0, cdf_hi - cdf_lo)
 
 
@@ -558,9 +601,13 @@ _DATE_RE = re.compile(
 )
 
 
-def parse_market_local_date(title: str, end_date_iso: str | None) -> str | None:
+def parse_market_local_date(
+    title: str, end_date_iso: str | None, city_tz: object = timezone.utc
+) -> str | None:
     """Returns 'YYYY-MM-DD' for the city's local resolution date.
-    Prefers explicit 'on Month Day' from title; falls back to (endDate - 4h).date()."""
+    Prefers explicit 'on Month Day' from title; falls back to endDate
+    converted into the city's local timezone (#10 — a fixed -4h offset is
+    wrong for Central/Mountain/Pacific cities and DST boundaries)."""
     if title:
         m = _DATE_RE.search(title)
         if m:
@@ -578,7 +625,7 @@ def parse_market_local_date(title: str, end_date_iso: str | None) -> str | None:
     if end_date_iso:
         try:
             dt = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
-            return (dt - timedelta(hours=4)).date().isoformat()
+            return dt.astimezone(city_tz).date().isoformat()
         except Exception:
             return None
     return None
@@ -603,13 +650,36 @@ SETTLED_FIELDS = [
 ]
 
 
+_POSITIONS_BAK = POSITIONS_JSON.with_suffix(".json.bak")
+
+
+def _read_positions(path: Path) -> list[dict] | None:
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        logger.error("load_positions: %s unreadable/corrupt: %s", path, e)
+        return None
+    if not isinstance(data, list):
+        logger.error("load_positions: %s is not a list (%s)", path, type(data).__name__)
+        return None
+    return data
+
+
 def load_positions() -> list[dict]:
     if not POSITIONS_JSON.exists():
         return []
-    try:
-        return json.loads(POSITIONS_JSON.read_text())
-    except Exception:
-        return []
+    data = _read_positions(POSITIONS_JSON)
+    if data is not None:
+        return data
+    # main file corrupt — recover from last good backup rather than silently
+    # returning [] (which would reopen/duplicate already-open exposure) (P3)
+    if _POSITIONS_BAK.exists():
+        data = _read_positions(_POSITIONS_BAK)
+        if data is not None:
+            logger.error("load_positions: recovered open positions from .bak")
+            return data
+    logger.error("load_positions: NO recoverable position book; returning empty")
+    return []
 
 
 def load_recent_stops() -> dict[str, float]:
@@ -641,12 +711,32 @@ def load_recent_stops() -> dict[str, float]:
 
 def save_positions(positions: list[dict]):
     POSITIONS_JSON.parent.mkdir(parents=True, exist_ok=True)
-    POSITIONS_JSON.write_text(json.dumps(positions, indent=2))
+    # keep previous good file as .bak, then write atomically so a crash
+    # mid-write cannot truncate the live position book (P3)
+    if POSITIONS_JSON.exists():
+        try:
+            os.replace(POSITIONS_JSON, _POSITIONS_BAK)
+        except OSError as e:
+            logger.warning("save_positions: could not refresh .bak: %s", e)
+    tmp = POSITIONS_JSON.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(positions, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, POSITIONS_JSON)
 
 
-def append_csv(path: Path, fields: list[str], rows: list[dict]):
+def append_csv(path: Path, fields: list[str], rows: list[dict], max_bytes: int | None = None):
     if not rows:
         return
+    # Size-based rotation: keep one rolling archive (.1) so high-volume
+    # telemetry like paper_decisions.csv can't grow unbounded (#6).
+    if max_bytes is not None:
+        try:
+            if path.exists() and path.stat().st_size >= max_bytes:
+                os.replace(path, path.with_suffix(path.suffix + ".1"))
+        except OSError as e:
+            logger.warning("append_csv: rotation failed for %s: %s", path, e)
     new_file = not path.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", newline="") as f:
@@ -699,12 +789,13 @@ def evaluate_city_kind(
     positions: list[dict],
     feed: WSPriceFeed,
     decisions_out: list[dict],
+    city_tz: object = timezone.utc,
 ):
     """Evaluate every bucket in this event; may open/close positions in `positions`.
     `forecast` is {model_name: periods} — NWS + Open-Meteo ensemble members."""
     title = event.get("title", "")
     end_iso = event.get("endDate")
-    local_date = parse_market_local_date(title, end_iso)
+    local_date = parse_market_local_date(title, end_iso, city_tz)
     if not local_date:
         return
     # Per-model daily extremes → ensemble mean (fcst_extreme) + spread (ensemble_std)
@@ -747,10 +838,17 @@ def evaluate_city_kind(
         t_hat = fcst_extreme
         locked = False
 
+    # Bias correction: forecast t_hat is systematically biased (lowest ~+1°F
+    # cold, Miami lowest ~+1.6°F). Per-(city, kind) when available, else pooled
+    # per-kind. Applied only when not locked — observed values are ground truth
+    # and need no shift. See data/calibration.json (per_city_kind / per_kind).
+    if t_hat is not None and not locked:
+        t_hat = t_hat + bias_for(city, kind)
+
     # σ: locked overrides all (residual 1°F). Otherwise take the larger of the
-    # lookup/empirical σ (historical prior) and the live ensemble spread — the
-    # latter reflects current multi-model disagreement.
-    sigma_base = sigma_for_hours(hours)
+    # per-kind empirical σ (or lookup fallback) and the live ensemble spread —
+    # the latter reflects current multi-model disagreement.
+    sigma_base = sigma_for_hours(hours, kind)
     if locked:
         sigma = 1.0
     else:
@@ -1010,6 +1108,7 @@ def decision_cycle(
     # One observation fetch per (city, kind) per cycle, TTL-cached inside helper
     obs_by_key: dict[tuple[str, str], float | None] = {}
     today_by_city: dict[str, str] = {}
+    city_tz_by_city: dict[str, object] = {}
     for entry in discovery:
         city, kind = entry["city"], entry["kind"]
         info = CITIES.get(city)
@@ -1020,6 +1119,7 @@ def decision_cycle(
             city_tz = ZoneInfo(grid.get("tz") or "UTC")
         except Exception:
             city_tz = timezone.utc
+        city_tz_by_city[city] = city_tz
         today_str = datetime.now(city_tz).date().isoformat()
         today_by_city[city] = today_str
         key = (city, kind)
@@ -1035,27 +1135,77 @@ def decision_cycle(
             continue
         observed = obs_by_key.get((city, kind))
         today_str = today_by_city.get(city, "")
+        city_tz = city_tz_by_city.get(city, timezone.utc)
         try:
             evaluate_city_kind(
                 city, kind, entry["event"], forecast,
                 observed, today_str,
-                positions, feed, decisions,
+                positions, feed, decisions, city_tz,
             )
         except Exception as e:
             logger.error(f"evaluate {city}/{kind} failed: {e}")
-    append_csv(DECISIONS_CSV, DECISION_FIELDS, decisions)
+    append_csv(DECISIONS_CSV, DECISION_FIELDS, decisions, max_bytes=_DECISIONS_MAX_BYTES)
     save_positions(positions)
 
 
 # ── Calibration ───────────────────────────────────────────────────────────────
 
 
-def compute_empirical_sigma() -> float | None:
-    """Derive σ from historical |settle_temp - t_hat_entry| residuals.
-    Prefers the t_hat_entry column; for older rows lacking it, backfills from
-    paper_decisions.csv by matching token_id. Returns None if <10 pairs.
+def load_kind_calibration() -> dict[str, dict[str, float]]:
+    """Load per-kind {bias, sigma, n} from calibration.json. Returns empty dict
+    if file missing or malformed. New schema is per_kind. Computed offline via
+    audit/compute_kind_calibration.py from IEM actuals (bypasses settle-bug
+    contamination)."""
+    cache_path = DATA_DIR / "calibration.json"
+    if not cache_path.exists():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text())
+    except Exception as e:
+        logger.warning("calibration.json unreadable (per_kind disabled): %s", e)
+        return {}
+    per_kind = data.get("per_kind") or {}
+    out: dict[str, dict[str, float]] = {}
+    for kind in ("highest", "lowest"):
+        v = per_kind.get(kind)
+        if not v:
+            continue
+        try:
+            out[kind] = {
+                "bias": float(v["bias"]),
+                "sigma": float(v["sigma"]),
+                "n": int(v.get("n", 0)),
+            }
+        except Exception:
+            continue
+    return out
 
-    Prefers the pinned calibration.json cache so σ survives CSV wipes."""
+
+def load_city_kind_bias() -> dict[str, float]:
+    """Load per-(city, kind) bias map from calibration.json `per_city_kind`.
+    Keys are "{city}|{kind}". Empty dict if missing/malformed."""
+    cache_path = DATA_DIR / "calibration.json"
+    if not cache_path.exists():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text())
+    except Exception as e:
+        logger.warning("calibration.json unreadable (per_city_kind disabled): %s", e)
+        return {}
+    raw = data.get("per_city_kind") or {}
+    out: dict[str, float] = {}
+    for k, v in raw.items():
+        try:
+            out[k] = float(v["bias"])
+        except Exception:
+            continue
+    return out
+
+
+def compute_empirical_sigma() -> float | None:
+    """Legacy entry retained for telemetry. Returns the pooled σ if present in
+    the calibration.json `empirical_sigma` field, else None. New decision path
+    uses per_kind via load_kind_calibration."""
     cache_path = DATA_DIR / "calibration.json"
     if cache_path.exists():
         try:
@@ -1186,7 +1336,7 @@ def settle_positions(positions: list[dict], grid_cache: dict[str, dict]):
             continue
 
         station = info["station"]
-        key = (station, pos["local_date"])
+        key = (station, pos["local_date"], pos["kind"])
         if key not in obs_cache:
             # Query a 3-day UTC window centered on local day to ensure full coverage
             start_iso = (local_date - timedelta(days=1)).isoformat() + "T00:00:00+00:00"
@@ -1219,8 +1369,13 @@ def settle_positions(positions: list[dict], grid_cache: dict[str, dict]):
                 lo, hi = float(lo_str), float(hi_str)
             except Exception:
                 continue
-        # Polymarket convention: bucket "67-68" = realised in [67, 68) (inclusive low, exclusive high)
-        in_bucket = (lo is None or extreme >= lo) and (hi is None or extreme < hi)
+        # Polymarket convention: integer-inclusive buckets — the official daily
+        # extreme is a whole degree F and "67-68" settles YES for 67 or 68,
+        # ">=N"/"<=N" inclusive. Round the observed extreme to the settled
+        # integer, then test inclusive bounds. Must mirror bucket_prob's
+        # half-degree edge model (C1/C2 kept consistent).
+        r_extreme = round(extreme)
+        in_bucket = (lo is None or r_extreme >= lo) and (hi is None or r_extreme <= hi)
         yes_won = bool(in_bucket)
         won = yes_won if pos["side"] == "YES" else (not yes_won)
         payout = pos["shares"] if won else 0.0
@@ -1250,6 +1405,13 @@ def settle_positions(positions: list[dict], grid_cache: dict[str, dict]):
         )
 
     append_csv(SETTLED_CSV, SETTLED_FIELDS, settled_rows)
+    # Drop SETTLED positions from the live book: they are already durably in
+    # paper_settled.csv and STOP cooldown is rebuilt from that CSV, so keeping
+    # them only bloats paper_positions.json and every cycle's save (#7).
+    settled_n = sum(1 for p in positions if p.get("status") == "SETTLED")
+    if settled_n:
+        positions[:] = [p for p in positions if p.get("status") != "SETTLED"]
+        logger.info(f"Pruned {settled_n} SETTLED position(s) from live book")
     save_positions(positions)
 
 
@@ -1257,13 +1419,22 @@ def settle_positions(positions: list[dict], grid_cache: dict[str, dict]):
 
 
 def main():
-    global _EMPIRICAL_SIGMA
+    global _KIND_CALIBRATION, _CITY_KIND_BIAS
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _EMPIRICAL_SIGMA = compute_empirical_sigma()
-    if _EMPIRICAL_SIGMA is not None:
-        logger.info(f"Empirical σ from settled RESOLVE = {_EMPIRICAL_SIGMA:.2f}°F (overrides lookup)")
+    _KIND_CALIBRATION = load_kind_calibration()
+    _CITY_KIND_BIAS = load_city_kind_bias()
+    if _KIND_CALIBRATION:
+        for kind in ("highest", "lowest"):
+            v = _KIND_CALIBRATION.get(kind)
+            if v:
+                logger.info(
+                    f"Kind calibration {kind}: bias={v['bias']:+.2f}°F  "
+                    f"σ={v['sigma']:.2f}°F  n={v['n']}"
+                )
     else:
-        logger.info("Empirical σ unavailable (<10 resolved); using lookup by lead time")
+        logger.info("Kind calibration unavailable; using σ lookup by lead time, no bias correction")
+    for k, b in sorted(_CITY_KIND_BIAS.items()):
+        logger.info(f"City-kind bias {k}: {b:+.2f}°F  (overrides per-kind)")
     logger.info(
         f"Paper trader starting — {len(CITIES)} cities, cycle={CYCLE_SECONDS}s, "
         f"sigma=variable(by lead time), edge>={EDGE_THRESHOLD_YES}/{EDGE_THRESHOLD_NO}x (YES/NO), "

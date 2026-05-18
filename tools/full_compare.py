@@ -8,22 +8,48 @@ flags sizing anomalies.
 Usage:
   python3 tools/full_compare.py [--hours 6]
 """
-import argparse, time, requests
+import argparse, json, os, time, requests
+from pathlib import Path
 
-BS = "0x331bf91c132af9d921e1908ca0979363fc47193f"
-US = "0x216eEe4DC3808a3f90A3E9612C7FF2f09DA3fDa6"
+_REPO = Path(__file__).resolve().parent.parent
+
+
+def _default_wallets() -> tuple[str, str]:
+    """BS from config.json wallets_to_track[0]; ours from .env /
+    POLYMARKET_PROXY_ADDRESS. Hard-coding US drifts from the real proxy
+    and silently compares the wrong wallet."""
+    bs = us = ""
+    try:
+        bs = json.loads((_REPO / "config.json").read_text())["wallets_to_track"][0]
+    except Exception as e:
+        print(f"warning: could not read BS wallet from config.json: {e}")
+    env_path = _REPO / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if line.startswith("POLYMARKET_PROXY_ADDRESS="):
+                us = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    us = os.environ.get("POLYMARKET_PROXY_ADDRESS", us).strip()
+    return bs, us
 
 
 def fetch(addr, since):
     rows, off = [], 0
     while True:
         url = f"https://data-api.polymarket.com/activity?user={addr}&limit=500&offset={off}"
-        batch = requests.get(url, timeout=15).json()
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        batch = r.json()
+        if not isinstance(batch, list):
+            raise RuntimeError(f"/activity returned {type(batch).__name__}, expected list")
         if not batch: break
         rows.extend(batch)
         if batch[-1].get("timestamp",0) < since: break
         off += 500
-        if off > 5000: break
+        if off > 5000:
+            if rows and rows[-1].get("timestamp", 0) >= since:
+                print("warning: pagination capped before cutoff — data incomplete")
+            break
     return [r for r in rows if r.get("type")=="TRADE" and r.get("timestamp",0) >= since]
 
 
@@ -51,10 +77,15 @@ def group(trades):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", type=int, default=6)
+    _bs_def, _us_def = _default_wallets()
+    ap.add_argument("--bs", default=_bs_def, help="BS wallet (default: config.json)")
+    ap.add_argument("--us", default=_us_def, help="our wallet (default: .env)")
     args = ap.parse_args()
+    if not args.bs or not args.us:
+        ap.error("could not resolve BS/US wallets; pass --bs/--us explicitly")
     since = time.time() - args.hours*3600
 
-    bs = fetch(BS, since); us = fetch(US, since)
+    bs = fetch(args.bs, since); us = fetch(args.us, since)
     bs_acts = group(bs); us_acts = group(us)
 
     print(f"BS raw: {len(bs)} → actions: {len(bs_acts)}")

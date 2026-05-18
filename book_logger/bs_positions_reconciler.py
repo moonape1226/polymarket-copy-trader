@@ -29,8 +29,12 @@ _DATA_API = "https://data-api.polymarket.com/positions"
 _FETCH_TIMEOUT = 15
 
 
-def _fetch_bs_holdings(wallet: str) -> set:
-    """Return set of asset_id strings BS currently holds (size > 0)."""
+def _fetch_bs_holdings(wallet: str) -> set | None:
+    """Return set of asset_id strings BS currently holds (size > 0).
+
+    Returns None (not an empty set) on any fetch/parse failure so the caller
+    can tell "BS holds nothing" apart from "we don't know" and avoid expiring
+    still-held tokens during an API outage."""
     try:
         r = requests.get(
             _DATA_API,
@@ -39,10 +43,11 @@ def _fetch_bs_holdings(wallet: str) -> set:
         )
         if not r.ok:
             logger.warning(f"reconciler: /positions {r.status_code} for {wallet[:8]}")
-            return set()
+            return None
         data = r.json()
         if not isinstance(data, list):
-            return set()
+            logger.warning(f"reconciler: /positions non-list for {wallet[:8]}")
+            return None
         out = set()
         for p in data:
             if not isinstance(p, dict):
@@ -57,20 +62,36 @@ def _fetch_bs_holdings(wallet: str) -> set:
         return out
     except Exception as e:
         logger.warning(f"reconciler: /positions fetch failed for {wallet[:8]}: {e}")
-        return set()
+        return None
 
 
 def _reconcile_once(watch_set: WatchSet, wallets: Iterable[str]) -> None:
     bs_holdings: set = set()
+    fetch_ok = True
     for w in wallets:
-        bs_holdings |= _fetch_bs_holdings(w)
+        held = _fetch_bs_holdings(w)
+        if held is None:
+            fetch_ok = False
+            continue
+        bs_holdings |= held
 
-    # 1. Make sure every BS-held token is in WatchSet as active
+    # 1. Make sure every BS-held token is in WatchSet as active (safe even on
+    #    partial data — adding never loses tokens)
     for aid in bs_holdings:
         watch_set.add(aid, source="chain", state="active")
 
-    # 2. Mark chain-source tokens BS no longer holds as grace
+    # 2. Mark chain-source tokens BS no longer holds as grace.
+    #    Skip entirely if any wallet fetch failed: an incomplete holdings view
+    #    would otherwise grace-expire tokens BS still holds (P2).
     transitioned = 0
+    if not fetch_ok:
+        expired = watch_set.expire_grace()
+        logger.warning(
+            f"reconciler: holdings fetch incomplete — skipping grace "
+            f"transitions this cycle (watchset_size={watch_set.size()} "
+            f"expired_grace={expired})"
+        )
+        return
     for aid in watch_set.tokens():
         # Only move chain-sourced tokens to grace; weather promotions follow
         # their own lifecycle in weather_universe (re-promotion or eviction).

@@ -116,7 +116,7 @@ def _parse_json_field(v: Any) -> list:
     return v if isinstance(v, list) else []
 
 
-def _fetch_active_weather() -> List[Dict[str, Any]]:
+def _fetch_active_weather() -> tuple[List[Dict[str, Any]], bool]:
     """Brute-force-paginate the entire active markets set. Polymarket has
     ~50k active markets at any time; default sort buries low-volume weather
     buckets way down, so we must scan the whole tail. ~100 requests per
@@ -127,6 +127,7 @@ def _fetch_active_weather() -> List[Dict[str, Any]]:
     limit = 500
     pages_max = 200  # 100,000-market upper bound; safety guard against runaway
     total_scanned = 0
+    complete = False  # True only if we scanned the full active set this cycle
     for _ in range(pages_max):
         try:
             r = requests.get(
@@ -144,19 +145,21 @@ def _fetch_active_weather() -> List[Dict[str, Any]]:
                 break
             data = r.json()
             if not isinstance(data, list) or not data:
+                complete = True
                 break
             total_scanned += len(data)
             for m in data:
                 if isinstance(m, dict) and _is_weather(m):
                     out.append(m)
             if len(data) < limit:
+                complete = True
                 break
             offset += limit
         except Exception as e:
             logger.warning(f"gamma fetch failed at offset={offset}: {e}")
             break
-    logger.debug(f"weather_universe: scanned {total_scanned} active markets, matched {len(out)}")
-    return out
+    logger.debug(f"weather_universe: scanned {total_scanned} active markets, matched {len(out)} (complete={complete})")
+    return out, complete
 
 
 def _build_row(market: Dict[str, Any], ts_ms: int) -> Dict[str, Any]:
@@ -283,16 +286,18 @@ def _probe_disappeared(seen_now: set) -> List[Dict[str, Any]]:
     """
     now = time.time()
     cutoff = now - _DISAPPEAR_PROBE_WINDOW_S
+    # Always GC stale registry entries — previously this only ran when there
+    # were no candidates, so a steady stream of disappearances let the
+    # registry grow unbounded (#287).
+    drop = [c for c, ts in _seen_recently.items() if ts < cutoff]
+    for c in drop:
+        _seen_recently.pop(c, None)
     # cids we've seen in the last `_DISAPPEAR_PROBE_WINDOW_S` but didn't see this cycle
     candidates = [
         cid for cid, last_seen in _seen_recently.items()
         if last_seen >= cutoff and cid not in seen_now
     ]
     if not candidates:
-        # GC stale registry entries
-        drop = [c for c, ts in _seen_recently.items() if ts < cutoff]
-        for c in drop:
-            _seen_recently.pop(c, None)
         return []
     # Polymarket gamma supports comma-separated `condition_ids`. Batch in 50s.
     out: List[Dict[str, Any]] = []
@@ -326,7 +331,7 @@ def run_loop(watch_set: WatchSet) -> None:
     )
     while True:
         try:
-            markets = _fetch_active_weather()
+            markets, complete = _fetch_active_weather()
             now_s = time.time()
             now_ms = int(now_s * 1000)
 
@@ -339,7 +344,17 @@ def run_loop(watch_set: WatchSet) -> None:
 
             # Review #1: probe markets that disappeared from the active set so
             # we capture closed/resolved transitions + final resolution rows.
-            disappeared = _probe_disappeared(seen_ids)
+            # Skip when the scan was incomplete: an unscanned tail would look
+            # falsely "disappeared" and emit bogus resolution rows / grace GC
+            # (#142).
+            if not complete:
+                logger.warning(
+                    "weather_universe: incomplete active scan — skipping "
+                    "disappeared-probe and grace GC this cycle"
+                )
+                disappeared: List[Dict[str, Any]] = []
+            else:
+                disappeared = _probe_disappeared(seen_ids)
             for m in disappeared:
                 cid = m.get("conditionId")
                 if not cid or not _is_weather(m):
@@ -353,7 +368,8 @@ def run_loop(watch_set: WatchSet) -> None:
                         # Within 1h grace: write final/resolution row
                         _write_row(_build_row(m, now_ms))
 
-            _gc_grace_set(seen_ids)
+            if complete:
+                _gc_grace_set(seen_ids)
 
             # Active markets — write a row each
             kept = [m for m in markets if m.get("conditionId")]

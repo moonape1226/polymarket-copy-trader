@@ -96,6 +96,21 @@ class WatchSet:
                 f"(source={entry.get('source')}, no grace/weather tokens left; "
                 f"cap={_HARD_CAP}, total dropped active={self._dropped_active})"
             )
+            # Persist a durable data-incomplete record: log lines rotate away
+            # but this means we stopped snapshotting a BS token (#89).
+            try:
+                os.makedirs(_DATA_DIR, exist_ok=True)
+                with open(os.path.join(_DATA_DIR, "watchset_evicted.jsonl"), "a") as _f:
+                    _f.write(json.dumps({
+                        "ts_ms": int(time.time() * 1000),
+                        "token_id": oldest[0],
+                        "source": entry.get("source"),
+                        "state": entry.get("state"),
+                        "cap": _HARD_CAP,
+                        "total_dropped_active": self._dropped_active,
+                    }) + "\n")
+            except OSError as e:
+                logger.warning(f"WatchSet: could not persist eviction record: {e}")
             return True
         return False
 

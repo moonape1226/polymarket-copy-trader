@@ -41,6 +41,17 @@ _block_ts_cache: Dict[int, int] = {}
 _block_ts_lock = threading.Lock()
 _receipt_cache: Dict[str, Optional[Dict[str, Any]]] = {}
 _receipt_lock = threading.Lock()
+_CACHE_MAX = 5000  # bound process-lifetime caches in this long-running recorder
+
+
+def _evict_oldest(cache: dict, keep: int) -> None:
+    """Drop oldest insertion-order entries so the cache stays bounded.
+    Caller must hold the cache's lock."""
+    excess = len(cache) - keep
+    if excess <= 0:
+        return
+    for k in list(cache.keys())[:excess]:
+        cache.pop(k, None)
 
 
 def _rpc(method: str, params: list, timeout: int = _RPC_TIMEOUT) -> Optional[Any]:
@@ -71,6 +82,7 @@ def _block_ts_ms(block: int) -> Optional[int]:
     ts_ms = int(res["timestamp"], 16) * 1000
     with _block_ts_lock:
         _block_ts_cache[block] = ts_ms
+        _evict_oldest(_block_ts_cache, _CACHE_MAX)
     return ts_ms
 
 
@@ -81,6 +93,7 @@ def _receipt(tx_hash: str) -> Optional[Dict[str, Any]]:
     res = _rpc("eth_getTransactionReceipt", [tx_hash])
     with _receipt_lock:
         _receipt_cache[tx_hash] = res
+        _evict_oldest(_receipt_cache, _CACHE_MAX)
     return res
 
 

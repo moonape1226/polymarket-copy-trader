@@ -185,39 +185,68 @@ class ChainSubscriber:
             from_block = max(0, self._last_block - 5)
             if from_block > head:
                 return
-            to_block = min(head, from_block + BACKFILL_MAX_BLOCKS - 1)
-            gap = to_block - from_block + 1
             logger.info(
-                f"chain_subscriber [{tag}]: backfilling {gap} block(s) "
-                f"[{from_block} → {to_block}]"
+                f"chain_subscriber [{tag}]: backfilling {head - from_block + 1} "
+                f"block(s) [{from_block} → {head}]"
             )
             total = 0
-            for wallet in self.wallets:
-                wtopic = _pad_addr_topic(wallet)
-                for slot_topics in (
-                    [ORDER_FILLED_TOPIC, None, wtopic],
-                    [ORDER_FILLED_TOPIC, None, None, wtopic],
-                ):
-                    params = [{
-                        "fromBlock": hex(from_block),
-                        "toBlock": hex(to_block),
-                        "address": EXCHANGES,
-                        "topics": slot_topics,
-                    }]
-                    resp = await loop.run_in_executor(None, lambda p=params: requests.post(
-                        http_url,
-                        json={"jsonrpc": "2.0", "id": 1, "method": "eth_getLogs", "params": p},
-                        timeout=20,
-                    ))
-                    result = resp.json().get("result", [])
-                    if isinstance(result, list):
+            # Page through the whole gap in BACKFILL_MAX_BLOCKS chunks. On any
+            # failed/error query, stop without advancing _last_block past the
+            # unfilled range so the next reconnect retries it (P1).
+            chunk_start = from_block
+            while chunk_start <= head:
+                chunk_end = min(head, chunk_start + BACKFILL_MAX_BLOCKS - 1)
+                chunk_ok = True
+                for wallet in self.wallets:
+                    wtopic = _pad_addr_topic(wallet)
+                    for slot_topics in (
+                        [ORDER_FILLED_TOPIC, None, wtopic],
+                        [ORDER_FILLED_TOPIC, None, None, wtopic],
+                    ):
+                        params = [{
+                            "fromBlock": hex(chunk_start),
+                            "toBlock": hex(chunk_end),
+                            "address": EXCHANGES,
+                            "topics": slot_topics,
+                        }]
+                        try:
+                            resp = await loop.run_in_executor(
+                                None, lambda p=params: requests.post(
+                                    http_url,
+                                    json={"jsonrpc": "2.0", "id": 1,
+                                          "method": "eth_getLogs", "params": p},
+                                    timeout=20,
+                                ))
+                            payload = resp.json()
+                        except Exception as e:
+                            logger.warning(
+                                f"chain_subscriber [{tag}]: backfill query "
+                                f"failed @ [{chunk_start}→{chunk_end}]: {e}")
+                            chunk_ok = False
+                            break
+                        result = payload.get("result")
+                        if not resp.ok or payload.get("error") or not isinstance(result, list):
+                            logger.warning(
+                                f"chain_subscriber [{tag}]: backfill RPC error "
+                                f"@ [{chunk_start}→{chunk_end}]: {payload.get('error')}")
+                            chunk_ok = False
+                            break
                         for log in result:
                             self._handle_log(log, source=f"{tag}-backfill")
                             total += 1
+                    if not chunk_ok:
+                        break
+                if not chunk_ok:
+                    logger.warning(
+                        f"chain_subscriber [{tag}]: backfill incomplete — "
+                        f"stopped before block {chunk_start}, will retry on "
+                        f"next reconnect")
+                    return
+                if chunk_end > self._last_block:
+                    self._last_block = chunk_end
+                chunk_start = chunk_end + 1
             if total:
                 logger.info(f"chain_subscriber [{tag}]: backfill processed {total} log(s)")
-            if to_block > self._last_block:
-                self._last_block = to_block
         except Exception as e:
             logger.warning(f"chain_subscriber [{tag}]: backfill failed: {e}")
 

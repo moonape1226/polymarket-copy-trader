@@ -14,6 +14,7 @@ import datetime
 import heapq
 import itertools
 import json
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import queue
@@ -193,17 +194,29 @@ class BookSnapshotPoller:
             except Exception as e:
                 logger.exception(f"book_snap event snapshot failed: {e}")
 
+    def _tick_one(self, asset_id: str) -> None:
+        try:
+            self._do_snapshot(asset_id, "tick", None)
+        except Exception as e:
+            logger.warning(f"book_snap tick failed for {asset_id[:12]}: {e}")
+
     def _tick_loop(self) -> None:
-        while True:
-            t0 = time.time()
-            tokens = self.watch_set.tokens()
-            for asset_id in tokens:
-                try:
-                    self._do_snapshot(asset_id, "tick", None)
-                except Exception as e:
-                    logger.warning(f"book_snap tick failed for {asset_id[:12]}: {e}")
-            elapsed = time.time() - t0
-            time.sleep(max(0.5, _TICK_INTERVAL_S - elapsed))
+        # Fetch the watchset concurrently: sequential REST at the 50-token cap
+        # × 4s timeout could take ~200s and blow the 10s cadence (#196).
+        # _write_row is lock-protected so parallel fetches are safe.
+        with ThreadPoolExecutor(max_workers=10, thread_name_prefix="book_tick") as pool:
+            while True:
+                t0 = time.time()
+                tokens = self.watch_set.tokens()
+                if tokens:
+                    list(pool.map(self._tick_one, tokens))
+                elapsed = time.time() - t0
+                if elapsed > _TICK_INTERVAL_S:
+                    logger.warning(
+                        f"book_snap tick pass took {elapsed:.1f}s for "
+                        f"{len(tokens)} token(s) — exceeds {_TICK_INTERVAL_S}s cadence"
+                    )
+                time.sleep(max(0.5, _TICK_INTERVAL_S - elapsed))
 
     def _do_snapshot(self, asset_id: str, trigger: str, event_meta: Optional[dict]) -> None:
         book, lat, method = _fetch_book(asset_id)

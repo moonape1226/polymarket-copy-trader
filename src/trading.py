@@ -297,6 +297,32 @@ class TradingModule:
         except Exception as e:
             logger.warning(f"Failed to write processed_buys.csv: {e}")
 
+    def _revert_pending_buy(self, asset_id: str) -> None:
+        """Undo the optimistic exposure/shares pre-added when a limit BUY was
+        placed, for the case the order is cancelled before it ever fills (e.g.
+        BS exits first). Without this the phantom exposure lingers until the
+        60s on-chain reconcile. Must be called BEFORE _clear_pending so the
+        _pending_* bookkeeping is still available."""
+        added_shares = self._pending_order_shares.get(asset_id)
+        if added_shares is None:
+            return  # not a tracked pending buy; nothing to revert
+        base_shares = self._pending_order_base_shares.get(asset_id, 0.0)
+        added_cost = self._pending_order_cost.get(asset_id, 0.0)
+        # restore _asset_shares to its pre-pending value
+        self._asset_shares[asset_id] = base_shares
+        if added_cost:
+            self._asset_exposure[asset_id] = max(
+                0.0, self._asset_exposure.get(asset_id, 0.0) - added_cost)
+            if self._asset_is_low_prob.get(asset_id):
+                self._low_prob_exposure = max(
+                    0.0, self._low_prob_exposure - added_cost)
+        # if nothing real remains for this asset, drop its tracking entirely
+        if base_shares < 0.01:
+            self._asset_exposure.pop(asset_id, None)
+            self._asset_shares.pop(asset_id, None)
+            self._asset_copy_rate.pop(asset_id, None)
+            self._asset_is_low_prob.pop(asset_id, None)
+
     def _clear_pending(self, asset_id: str) -> None:
         self._pending_order_ids.pop(asset_id, None)
         self._pending_order_times.pop(asset_id, None)
@@ -1419,6 +1445,7 @@ class TradingModule:
                         try:
                             self.poly.cancel_order(pending_oid)
                             self._log_gtc_cancelled(asset_id, placed_at, "bs_exit")
+                            self._revert_pending_buy(asset_id)
                             self._clear_pending(asset_id)
                         except Exception as e:
                             logger.warning(f"Failed to cancel pending order {pending_oid[:16]}: {e}")

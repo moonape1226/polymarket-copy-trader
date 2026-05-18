@@ -19,6 +19,7 @@ import requests
 from typing import List, Dict, Any
 
 from web3 import Web3
+from web3.exceptions import ContractLogicError
 from eth_account import Account
 from eth_abi import encode as abi_encode
 from eth_utils import keccak
@@ -107,14 +108,26 @@ def _safe_tx_hash(safe_address: str, to: str, data: bytes, nonce: int, chain_id:
 
 def _fetch_redeemable_positions(proxy_address: str) -> List[Dict[str, Any]]:
     """Return positions where redeemable=True from the Polymarket data API."""
+    out: List[Dict[str, Any]] = []
+    offset = 0
+    limit = 500
     try:
-        resp = requests.get(
-            "https://data-api.polymarket.com/positions",
-            params={"user": proxy_address, "sizeThreshold": ".01"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return [p for p in resp.json() if p.get("redeemable")]
+        while True:
+            resp = requests.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": proxy_address, "sizeThreshold": ".01",
+                        "limit": limit, "offset": offset},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, list) or not data:
+                break
+            out.extend(p for p in data if p.get("redeemable"))
+            if len(data) < limit:
+                break
+            offset += limit
+        return out
     except Exception as e:
         logger.error(f"Failed to fetch positions for redemption: {e}")
         return []
@@ -198,11 +211,21 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
             # rather than burn gas on a guaranteed-revert tx.
             try:
                 tx["gas"] = w3.eth.estimate_gas(tx)
-            except Exception as e:
+            except ContractLogicError as e:
+                # Genuine on-chain revert = nothing to redeem (already redeemed,
+                # unresolved, zero balance). Safe to cache and stop retrying.
                 _redeem_done_cache.add((condition_id, outcome_index))
                 logger.info(
                     f"Skipping {title} ({'neg-risk' if is_neg_risk else 'std'}): "
-                    f"redemption pre-flight failed ({type(e).__name__})"
+                    f"nothing to redeem ({type(e).__name__})"
+                )
+                continue
+            except Exception as e:
+                # Transient RPC/network error — do NOT cache, retry next cycle
+                # so a momentary outage doesn't permanently skip a payout (P2).
+                logger.warning(
+                    f"Redemption pre-flight transient error for {title}, will "
+                    f"retry: {type(e).__name__}: {e}"
                 )
                 continue
 

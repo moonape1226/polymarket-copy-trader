@@ -58,6 +58,8 @@ def fetch_activity(wallet: str, since_ts: float) -> list[dict]:
         )
         r.raise_for_status()
         batch = r.json() or []
+        if not isinstance(batch, list):
+            raise RuntimeError(f"/activity returned {type(batch).__name__}, expected list: {batch!r:.200}")
         if not batch:
             break
         rows.extend(batch)
@@ -65,6 +67,11 @@ def fetch_activity(wallet: str, since_ts: float) -> list[dict]:
             break
         offset += limit
         if offset > 5000:
+            # Hit the hard page cap before reaching the cutoff — data is
+            # truncated and anomalies in the older window will be missed.
+            if rows and rows[-1].get("timestamp", 0) >= since_ts:
+                print(f"WARNING: /activity pagination capped at {offset} rows "
+                      f"before reaching cutoff — report is incomplete", file=sys.stderr)
             break
     return [r for r in rows if r.get("timestamp", 0) >= since_ts and r.get("type") == "TRADE"]
 
@@ -76,7 +83,10 @@ def fetch_positions(wallet: str) -> list[dict]:
         timeout=15,
     )
     r.raise_for_status()
-    return r.json() or []
+    data = r.json() or []
+    if not isinstance(data, list):
+        raise RuntimeError(f"/positions returned {type(data).__name__}, expected list: {data!r:.200}")
+    return data
 
 
 def agg_trades_by_asset(trades: list[dict]) -> dict[str, dict]:
@@ -247,8 +257,15 @@ def main() -> int:
     args = ap.parse_args()
 
     env = load_env(ENV)
-    cfg = json.loads(CFG.read_text())
-    bs_addr = cfg["wallets_to_track"][0]
+    try:
+        cfg = json.loads(CFG.read_text())
+        wallets = cfg["wallets_to_track"]
+        if not isinstance(wallets, list) or not wallets:
+            raise ValueError("wallets_to_track missing or empty")
+        bs_addr = wallets[0]
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as e:
+        print(f"config error ({CFG}): {e}", file=sys.stderr)
+        return 2
     our_addr = (env.get("POLYMARKET_PROXY_ADDRESS") or os.environ.get("POLYMARKET_PROXY_ADDRESS") or "").strip()
     if not our_addr:
         print("POLYMARKET_PROXY_ADDRESS not set", file=sys.stderr)
@@ -266,7 +283,11 @@ def main() -> int:
         if not hook:
             print("SLACK_WEBHOOK_URL not set; skipping Slack post", file=sys.stderr)
         else:
-            post_slack(hook, format_report(r))
+            # Don't let a Slack failure mask the anomaly-based exit code
+            try:
+                post_slack(hook, format_report(r))
+            except requests.RequestException as e:
+                print(f"WARNING: Slack post failed: {e}", file=sys.stderr)
 
     return 1 if r["anomalies"] else 0
 
