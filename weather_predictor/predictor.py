@@ -441,9 +441,11 @@ def fetch_weather_events() -> list[dict]:
                 # wrong across 'Z' vs '+00:00' and microsecond differences (#9)
                 try:
                     end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=timezone.utc)
                     if end_dt < now_dt:
                         continue
-                except ValueError:
+                except (ValueError, TypeError):
                     pass
             title_lc = (ev.get("title") or "").lower()
             if "temperature" not in title_lc:
@@ -667,6 +669,14 @@ def _read_positions(path: Path) -> list[dict] | None:
 
 def load_positions() -> list[dict]:
     if not POSITIONS_JSON.exists():
+        # Main missing: could be first run, OR a crash between the .bak
+        # rename and the temp replace. Recover from .bak if present (A5).
+        if _POSITIONS_BAK.exists():
+            data = _read_positions(_POSITIONS_BAK)
+            if data is not None:
+                logger.error("load_positions: main missing — recovered from .bak")
+                return data
+            logger.error("load_positions: main missing and .bak unreadable; empty")
         return []
     data = _read_positions(POSITIONS_JSON)
     if data is not None:
@@ -1282,6 +1292,7 @@ def settle_positions(positions: list[dict], grid_cache: dict[str, dict]):
         return
     today_utc = datetime.now(timezone.utc).date()
     settled_rows: list[dict] = []
+    to_settle: list[dict] = []  # marked SETTLED only after CSV append succeeds (A6)
     obs_cache: dict[tuple[str, str], float | None] = {}  # (station, local_date) -> extreme
 
     for pos in positions:
@@ -1374,7 +1385,9 @@ def settle_positions(positions: list[dict], grid_cache: dict[str, dict]):
         # ">=N"/"<=N" inclusive. Round the observed extreme to the settled
         # integer, then test inclusive bounds. Must mirror bucket_prob's
         # half-degree edge model (C1/C2 kept consistent).
-        r_extreme = round(extreme)
+        # half-up rounding (NOT Python's banker's round): bucket_prob uses
+        # [N-0.5, N+0.5) so 68.5 must settle as 69, matching that mass (A10)
+        r_extreme = math.floor(extreme + 0.5)
         in_bucket = (lo is None or r_extreme >= lo) and (hi is None or r_extreme <= hi)
         yes_won = bool(in_bucket)
         won = yes_won if pos["side"] == "YES" else (not yes_won)
@@ -1398,13 +1411,26 @@ def settle_positions(positions: list[dict], grid_cache: dict[str, dict]):
             "t_hat_entry": f"{pos.get('t_hat_entry', ''):.2f}" if pos.get("t_hat_entry") is not None else "",
             "sigma_entry": f"{pos.get('sigma_entry', ''):.2f}" if pos.get("sigma_entry") is not None else "",
         })
-        pos["status"] = "SETTLED"
+        # Defer the SETTLED status flip until the CSV row is durably written
+        # (A6) — otherwise a failed append loses the settlement entirely while
+        # the position is dropped from the live book.
+        to_settle.append(pos)
         logger.info(
             f"SETTLE {pos['city']} {pos['kind']} {pos['local_date']} {pos['bucket']} "
             f"{pos['side']}  observed={extreme:.1f}°F  won={won}  pnl=${pnl:+.2f}"
         )
 
-    append_csv(SETTLED_CSV, SETTLED_FIELDS, settled_rows)
+    if to_settle:
+        try:
+            append_csv(SETTLED_CSV, SETTLED_FIELDS, settled_rows)
+        except Exception as e:
+            # Append failed — leave positions OPEN so they re-settle next
+            # cycle rather than losing the settlement record (A6).
+            logger.error(f"settle: paper_settled.csv append failed, will retry: {e}")
+            return
+        # CSV durably written — now safe to flip status, prune and save.
+        for p in to_settle:
+            p["status"] = "SETTLED"
     # Drop SETTLED positions from the live book: they are already durably in
     # paper_settled.csv and STOP cooldown is rebuilt from that CSV, so keeping
     # them only bloats paper_positions.json and every cycle's save (#7).

@@ -101,6 +101,7 @@ class TradingModule:
         self._asset_shares: Dict[str, float] = {}      # asset_id → shares we hold
         self._low_prob_exposure: float = 0.0           # USD currently in low-prob positions
         self._exposure_last_refresh: float = 0.0       # timestamp of last exposure refresh
+        self._in_exposure_refresh: bool = False        # re-entrancy guard for _refresh_exposure
         self._pusd_balance_cached: float = 0.0
         self._pusd_balance_refresh: float = 0.0
         self._pending_order_ids: Dict[str, str] = {}    # asset_id → unfilled GTC buy order_id
@@ -109,6 +110,10 @@ class TradingModule:
         self._pending_order_shares: Dict[str, float] = {}  # asset_id → unfilled shares on pending order
         self._pending_order_base_shares: Dict[str, float] = {}  # asset_id → held shares before placing/importing order
         self._pending_order_cost: Dict[str, float] = {}    # asset_id → USD cost of pending order
+        # exact optimistic exposure (USD) we added at placement for a pending
+        # limit buy — used to revert precisely if it's cancelled before any
+        # fill. Only set on the placement path, not import (A2).
+        self._pending_order_exposure_added: Dict[str, float] = {}
         self._pending_order_entry_ttl: Dict[str, float] = {}  # asset_id → seconds before entry cancel
         # Sell-side maker-with-TTL tracking (profit: long TTL, loss: short TTL)
         self.sell_maker_ttl_profit = float(config.get("sell_maker_ttl_profit_seconds", 120))
@@ -298,30 +303,31 @@ class TradingModule:
             logger.warning(f"Failed to write processed_buys.csv: {e}")
 
     def _revert_pending_buy(self, asset_id: str) -> None:
-        """Undo the optimistic exposure/shares pre-added when a limit BUY was
-        placed, for the case the order is cancelled before it ever fills (e.g.
-        BS exits first). Without this the phantom exposure lingers until the
-        60s on-chain reconcile. Must be called BEFORE _clear_pending so the
-        _pending_* bookkeeping is still available."""
-        added_shares = self._pending_order_shares.get(asset_id)
-        if added_shares is None:
-            return  # not a tracked pending buy; nothing to revert
-        base_shares = self._pending_order_base_shares.get(asset_id, 0.0)
-        added_cost = self._pending_order_cost.get(asset_id, 0.0)
-        # restore _asset_shares to its pre-pending value
-        self._asset_shares[asset_id] = base_shares
-        if added_cost:
-            self._asset_exposure[asset_id] = max(
-                0.0, self._asset_exposure.get(asset_id, 0.0) - added_cost)
-            if self._asset_is_low_prob.get(asset_id):
-                self._low_prob_exposure = max(
-                    0.0, self._low_prob_exposure - added_cost)
-        # if nothing real remains for this asset, drop its tracking entirely
-        if base_shares < 0.01:
-            self._asset_exposure.pop(asset_id, None)
-            self._asset_shares.pop(asset_id, None)
-            self._asset_copy_rate.pop(asset_id, None)
-            self._asset_is_low_prob.pop(asset_id, None)
+        """Undo the optimistic exposure pre-added when a limit BUY was placed,
+        for the case it is cancelled before it ever fills (BS exits, entry TTL,
+        re-dispatch). Without this the phantom exposure lingers until the 60s
+        reconcile and skews cap/size decisions. Also clears pending bookkeeping
+        (covers imported orders, which have no optimistic add)."""
+        was_optimistic = asset_id in self._pending_order_exposure_added
+        # Capture the post-refresh pending contribution before clearing it.
+        pending_cost = self._pending_order_cost.get(asset_id, 0.0)
+        self._clear_pending(asset_id)
+        if not was_optimistic:
+            return  # imported order — exposure is refresh-derived, nothing to undo
+        # Exposure has two representations: optimistic placement-time
+        # (our_size*price added directly) OR post-refresh (on-chain +
+        # _pending_order_cost). Hand-subtracting one corrupts the other (A2).
+        if self._in_exposure_refresh:
+            # Already inside _refresh_exposure: exposure == on-chain +
+            # _pending_order_cost (low_prob/shares exclude pending). Removing
+            # this asset's now-cancelled pending cost is exactly correct.
+            if pending_cost:
+                self._asset_exposure[asset_id] = max(
+                    0.0, self._asset_exposure.get(asset_id, 0.0) - pending_cost)
+        else:
+            # Standalone: rebuild authoritatively from on-chain + remaining
+            # pending — representation-agnostic and correct.
+            self._refresh_exposure(cancel_expired=False)
 
     def _clear_pending(self, asset_id: str) -> None:
         self._pending_order_ids.pop(asset_id, None)
@@ -330,6 +336,7 @@ class TradingModule:
         self._pending_order_shares.pop(asset_id, None)
         self._pending_order_base_shares.pop(asset_id, None)
         self._pending_order_cost.pop(asset_id, None)
+        self._pending_order_exposure_added.pop(asset_id, None)
         self._pending_order_entry_ttl.pop(asset_id, None)
 
     def _buy_entry_ttl_seconds(self, ref_price: Optional[float]) -> float:
@@ -972,7 +979,7 @@ class TradingModule:
                 expires_at=placed_at + ttl, bs_holds_at_expiry=bs_holds,
             )
             self._log_gtc_cancelled(asset_id, placed_at, "entry_ttl")
-            self._clear_pending(asset_id)
+            self._revert_pending_buy(asset_id)  # also clears pending (A2)
 
     def check_pending_buys(self):
         if not self._pending_order_times:
@@ -988,6 +995,9 @@ class TradingModule:
 
     def _refresh_exposure(self, cancel_expired: bool = True):
         """Rebuild _asset_exposure, _asset_shares, and _low_prob_exposure from on-chain positions."""
+        if self._in_exposure_refresh:
+            return  # re-entrancy guard (revert path may call us recursively)
+        self._in_exposure_refresh = True
         try:
             all_positions = get_user_positions(self._proxy_address)
             if all_positions is None:
@@ -1032,6 +1042,8 @@ class TradingModule:
             logger.debug(f"Refreshed exposure: {len(new_exposure)} positions, low_prob ${new_low_prob_exposure:.2f}")
         except Exception as e:
             logger.warning(f"Failed to refresh exposure: {e}")
+        finally:
+            self._in_exposure_refresh = False
 
     def _ensure_exposure_fresh(self):
         if time.time() - self._exposure_last_refresh > 60:
@@ -1446,7 +1458,6 @@ class TradingModule:
                             self.poly.cancel_order(pending_oid)
                             self._log_gtc_cancelled(asset_id, placed_at, "bs_exit")
                             self._revert_pending_buy(asset_id)
-                            self._clear_pending(asset_id)
                         except Exception as e:
                             logger.warning(f"Failed to cancel pending order {pending_oid[:16]}: {e}")
                     else:
@@ -1525,7 +1536,7 @@ class TradingModule:
                     except Exception as e:
                         logger.warning(f"Failed to cancel previous pending {old_id[:16]}: {e}")
                     self._log_gtc_cancelled(asset_id, placed_at, "redispatch")
-                    self._clear_pending(asset_id)
+                    self._revert_pending_buy(asset_id)  # also clears pending (A2)
 
             order = self._create_order(
                 market_id=market_id,
@@ -1596,6 +1607,10 @@ class TradingModule:
                     self._pending_order_shares[asset_id] = our_size
                     self._pending_order_base_shares[asset_id] = self._asset_shares.get(asset_id, 0.0)
                     self._pending_order_cost[asset_id] = our_size * float(limit_price) if limit_price else 0.0
+                    # exact optimistic exposure added below (price-based, not
+                    # limit_price) so _revert_pending_buy can undo it precisely
+                    self._pending_order_exposure_added[asset_id] = (
+                        our_size * float(price) if price is not None else 0.0)
                     self._pending_order_entry_ttl[asset_id] = entry_ttl
                 if price is not None:
                     self._asset_exposure[asset_id] = self._asset_exposure.get(asset_id, 0.0) + our_size * float(price)

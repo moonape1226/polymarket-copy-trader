@@ -57,7 +57,7 @@ def fetch_activity(wallet: str, since_ts: float) -> list[dict]:
             timeout=15,
         )
         r.raise_for_status()
-        batch = r.json() or []
+        batch = r.json()  # NOT `or []` — that would mask falsy non-list ({}, null) (A11)
         if not isinstance(batch, list):
             raise RuntimeError(f"/activity returned {type(batch).__name__}, expected list: {batch!r:.200}")
         if not batch:
@@ -83,7 +83,7 @@ def fetch_positions(wallet: str) -> list[dict]:
         timeout=15,
     )
     r.raise_for_status()
-    data = r.json() or []
+    data = r.json()  # NOT `or []` — would mask falsy non-list (A11)
     if not isinstance(data, list):
         raise RuntimeError(f"/positions returned {type(data).__name__}, expected list: {data!r:.200}")
     return data

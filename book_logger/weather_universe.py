@@ -277,6 +277,15 @@ def _gc_grace_set(observed_market_ids: set) -> None:
         _grace_started.pop(m, None)
 
 
+def _gc_seen_recently() -> None:
+    """Drop `_seen_recently` entries past the probe window. Standalone so it
+    runs every loop even when _probe_disappeared is skipped on an incomplete
+    scan — otherwise the registry grows unbounded during partial scans (A9)."""
+    cutoff = time.time() - _DISAPPEAR_PROBE_WINDOW_S
+    for c in [c for c, ts in _seen_recently.items() if ts < cutoff]:
+        _seen_recently.pop(c, None)
+
+
 def _probe_disappeared(seen_now: set) -> List[Dict[str, Any]]:
     """Review #1: closed/resolved markets disappear from `active=true&closed=false`.
     For markets we saw active recently but missing this cycle, do a targeted
@@ -286,12 +295,7 @@ def _probe_disappeared(seen_now: set) -> List[Dict[str, Any]]:
     """
     now = time.time()
     cutoff = now - _DISAPPEAR_PROBE_WINDOW_S
-    # Always GC stale registry entries — previously this only ran when there
-    # were no candidates, so a steady stream of disappearances let the
-    # registry grow unbounded (#287).
-    drop = [c for c, ts in _seen_recently.items() if ts < cutoff]
-    for c in drop:
-        _seen_recently.pop(c, None)
+    _gc_seen_recently()
     # cids we've seen in the last `_DISAPPEAR_PROBE_WINDOW_S` but didn't see this cycle
     candidates = [
         cid for cid, last_seen in _seen_recently.items()
@@ -347,6 +351,7 @@ def run_loop(watch_set: WatchSet) -> None:
             # Skip when the scan was incomplete: an unscanned tail would look
             # falsely "disappeared" and emit bogus resolution rows / grace GC
             # (#142).
+            _gc_seen_recently()  # every loop, even when probe is skipped (A9)
             if not complete:
                 logger.warning(
                     "weather_universe: incomplete active scan — skipping "

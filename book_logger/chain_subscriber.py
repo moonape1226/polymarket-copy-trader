@@ -71,6 +71,9 @@ class ChainSubscriber:
         self._thread: Optional[threading.Thread] = None
         self._seen_logs: "OrderedDict[Tuple[str, str], float]" = OrderedDict()
         self._last_block: int = 0
+        # While true, _handle_log must NOT advance _last_block — backfill
+        # commits the watermark per fully-successful chunk instead (A1).
+        self._in_backfill: bool = False
 
     def start(self) -> None:
         if self._thread is not None:
@@ -171,6 +174,7 @@ class ChainSubscriber:
     async def _backfill_http(self, http_url: str, tag: str) -> None:
         if self._last_block <= 0:
             return
+        self._in_backfill = True
         try:
             loop = asyncio.get_running_loop()
             head_resp = await loop.run_in_executor(None, lambda: requests.post(
@@ -249,6 +253,8 @@ class ChainSubscriber:
                 logger.info(f"chain_subscriber [{tag}]: backfill processed {total} log(s)")
         except Exception as e:
             logger.warning(f"chain_subscriber [{tag}]: backfill failed: {e}")
+        finally:
+            self._in_backfill = False
 
     def _dedup_seen(self, key: Tuple[str, str]) -> bool:
         now = time.time()
@@ -279,7 +285,7 @@ class ChainSubscriber:
             block = int(block_hex, 16)
         except (TypeError, ValueError):
             block = 0
-        if block > self._last_block:
+        if block > self._last_block and not self._in_backfill:
             self._last_block = block
 
         # Quick wallet check before pushing — keep filter consistent with the

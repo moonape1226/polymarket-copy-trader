@@ -85,11 +85,12 @@ def _reconcile_once(watch_set: WatchSet, wallets: Iterable[str]) -> None:
     #    would otherwise grace-expire tokens BS still holds (P2).
     transitioned = 0
     if not fetch_ok:
-        expired = watch_set.expire_grace()
+        # Skip BOTH grace transitions and grace expiration: with an incomplete
+        # holdings view we must not drop tokens that may still be held (A8).
         logger.warning(
             f"reconciler: holdings fetch incomplete — skipping grace "
-            f"transitions this cycle (watchset_size={watch_set.size()} "
-            f"expired_grace={expired})"
+            f"transitions AND expiration this cycle "
+            f"(watchset_size={watch_set.size()})"
         )
         return
     for aid in watch_set.tokens():

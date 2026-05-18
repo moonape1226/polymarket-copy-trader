@@ -115,13 +115,15 @@ def load_history() -> list:
         data = _load_json_list(HISTORY_FILE)
         if data is not None:
             return data
-        # main file corrupt — recover from last good backup before the
-        # caller's save_history() would otherwise overwrite it with []
-        if _HISTORY_BAK.exists():
-            data = _load_json_list(_HISTORY_BAK)
-            if data is not None:
-                logger.warning("load_history: recovered calibration from .bak")
-                return data
+        logger.error("load_history: main corrupt — trying .bak")
+    # main missing (crash between rotate and replace) or corrupt: recover
+    # from the last known-good backup before save_history overwrites with []
+    if _HISTORY_BAK.exists():
+        data = _load_json_list(_HISTORY_BAK)
+        if data is not None:
+            logger.warning("load_history: recovered calibration from .bak")
+            return data
+    if HISTORY_FILE.exists() or _HISTORY_BAK.exists():
         logger.error("load_history: no recoverable history; starting empty")
     return []
 
@@ -133,18 +135,20 @@ def save_history(records: list):
         if not r.get("resolved") or r.get("expiry_ts", 0) > cutoff
     ]
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # keep the previous good file as .bak, then write atomically so a crash
-    # or disk-full mid-write cannot truncate scan_history.json (P3)
-    if HISTORY_FILE.exists():
-        try:
-            os.replace(HISTORY_FILE, _HISTORY_BAK)
-        except OSError as e:
-            logger.warning(f"save_history: could not refresh .bak: {e}")
+    # 1. write+fsync the new content to a temp file FIRST
     tmp = HISTORY_FILE.with_suffix(".json.tmp")
     with open(tmp, "w") as f:
         json.dump(records, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
+    # 2. refresh .bak only from a *valid* current file — never overwrite a
+    #    good backup with a corrupt/truncated main (A7)
+    if HISTORY_FILE.exists() and _load_json_list(HISTORY_FILE) is not None:
+        try:
+            os.replace(HISTORY_FILE, _HISTORY_BAK)
+        except OSError as e:
+            logger.warning(f"save_history: could not refresh .bak: {e}")
+    # 3. atomically swap the new content into place
     os.replace(tmp, HISTORY_FILE)
 
 
@@ -246,9 +250,10 @@ def check_resolutions(history: list) -> tuple[list, int]:
             continue
         # Prefer explicit resolution flags; fall back to the price heuristic so
         # a resolved market with a stale/non-0.99 price is not missed (#185).
+        # NOT `closed`: it only means trading stopped/expired, not resolved —
+        # a closed-but-pending market (e.g. 0.62/0.38) must not be scored (A3).
         resolved_flag = (
-            bool(market.get("closed"))
-            or market.get("umaResolutionStatus") == "resolved"
+            market.get("umaResolutionStatus") == "resolved"
             or market.get("resolved") is True
         )
         if not resolved_flag and max(prices) < 0.99:
@@ -508,14 +513,6 @@ def scan(history: list) -> list:
         key=lambda e: e["days"],
     )
 
-    # Update last_notified_prob before logging/sending
-    for ev in events_list:
-        for m in ev["markets"]:
-            if m.get("should_notify"):
-                rec = cid_to_rec.get(m["condition_id"])
-                if rec is not None:
-                    rec["last_notified_prob"] = m["prob"]
-
     if not events_list:
         logger.info("No new or updated opportunities.")
         return history
@@ -541,18 +538,34 @@ def scan(history: list) -> list:
 
     # Actually deliver the alert — previously _send_slack was never called so
     # new/updated markets only ever hit the log (dead alert path).
+    # Only mark markets as notified once delivery actually succeeds; if a
+    # configured webhook fails, leave last_notified_prob so the next scan
+    # retries instead of silently dropping the alert (A4). With no webhook
+    # the scanner is log-only, so logging counts as notified.
     if SLACK_WEBHOOK:
+        notified = False
         try:
-            _send_slack(events_list)
+            notified = _send_slack(events_list)
         except Exception as e:
             logger.warning(f"Slack send failed: {e}")
+    else:
+        notified = True
+
+    if notified:
+        for ev in events_list:
+            for m in ev["markets"]:
+                if m.get("should_notify"):
+                    rec = cid_to_rec.get(m["condition_id"])
+                    if rec is not None:
+                        rec["last_notified_prob"] = m["prob"]
 
     return history
 
 
 # ── Slack ─────────────────────────────────────────────────────────────────────
 
-def _send_slack(events_list: list):
+def _send_slack(events_list: list) -> bool:
+    """Returns True only if the alert was actually delivered (A4)."""
     blocks = [
         {
             "type": "header",
@@ -586,8 +599,10 @@ def _send_slack(events_list: list):
     try:
         requests.post(SLACK_WEBHOOK, json={"blocks": blocks}, timeout=10).raise_for_status()
         logger.info("Slack notification sent.")
+        return True
     except Exception as e:
         logger.error(f"Failed to send Slack notification: {e}")
+        return False
 
 
 def _send_calibration_slack(resolved: list, correct: int, total: int, buckets: dict):

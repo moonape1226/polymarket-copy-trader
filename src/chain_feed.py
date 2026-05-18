@@ -89,6 +89,9 @@ class ChainFeed:
         # Shared dedup + last-block state across all provider loops.
         self._seen_logs: "OrderedDict[tuple[str, str], float]" = OrderedDict()
         self._last_block: int = 0  # max block we've successfully processed
+        # While true, _handle_log must NOT advance _last_block — backfill
+        # commits the watermark per fully-successful chunk instead (A1).
+        self._in_backfill: bool = False
 
     def start(self):
         if self._thread is not None:
@@ -198,6 +201,7 @@ class ChainFeed:
         Dedup guards against overlap with live WS."""
         if self._last_block <= 0:
             return
+        self._in_backfill = True
         try:
             loop = asyncio.get_running_loop()
             head_resp = await loop.run_in_executor(None, lambda: requests.post(
@@ -272,6 +276,8 @@ class ChainFeed:
                 logger.info(f"Chain feed [{tag}]: backfill processed {total} log(s)")
         except Exception as e:
             logger.warning(f"Chain feed [{tag}]: backfill failed: {e}")
+        finally:
+            self._in_backfill = False
 
     def _dedup_seen(self, key: tuple[str, str]) -> bool:
         """Return True if key was already processed. Otherwise mark seen."""
@@ -305,7 +311,7 @@ class ChainFeed:
             block = int(block_hex, 16)
         except (TypeError, ValueError):
             block = 0
-        if block > self._last_block:
+        if block > self._last_block and not self._in_backfill:
             self._last_block = block
 
         maker = "0x" + topics[2][-40:].lower()
