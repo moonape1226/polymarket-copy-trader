@@ -116,8 +116,8 @@ def save_history(records: list):
 def fetch_events() -> list:
     all_events = []
     offset = 0
-    batch_size = 200
-    for _ in range(20):
+    batch_size = 100  # gamma-api hard-caps /events at 100/page regardless of limit
+    for _ in range(40):  # 40×100 keeps the prior ~4000-event depth
         for attempt in range(3):
             try:
                 resp = requests.get(

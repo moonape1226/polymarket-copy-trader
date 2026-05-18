@@ -12,6 +12,7 @@ Spec: docs/book_logger_spec.md §4.1 + §6 Phase 2.
 
 import datetime
 import heapq
+import itertools
 import json
 import logging
 import os
@@ -141,7 +142,11 @@ class BookSnapshotPoller:
         self.trigger_queue = snapshot_trigger_queue
         self.watch_set = watch_set
         self._sched_lock = threading.Lock()
-        self._scheduled: list = []  # heapq of (due_at_ms, asset_id, event_meta)
+        # heapq of (due_at_ms, seq, asset_id, event_meta). seq is a monotonic
+        # tiebreaker so heapq never falls through to comparing dict event_meta
+        # (raises TypeError) when due_at_ms+asset_id collide for clustered fills.
+        self._scheduled: list = []
+        self._seq = itertools.count()
 
     def start(self) -> None:
         threading.Thread(target=self._intake_loop, daemon=True, name="book_snap_intake").start()
@@ -165,7 +170,10 @@ class BookSnapshotPoller:
                     for off in _EVENT_OFFSETS_MS:
                         meta = dict(payload)
                         meta["offset_ms"] = off
-                        heapq.heappush(self._scheduled, (ev_received + off, asset_id, meta))
+                        heapq.heappush(
+                            self._scheduled,
+                            (ev_received + off, next(self._seq), asset_id, meta),
+                        )
             except Exception as e:
                 logger.exception(f"book_snap intake failed: {e}")
 
@@ -179,7 +187,7 @@ class BookSnapshotPoller:
             if task is None:
                 time.sleep(0.05)
                 continue
-            _, asset_id, meta = task
+            _, _, asset_id, meta = task
             try:
                 self._do_snapshot(asset_id, "bs_event", meta)
             except Exception as e:
