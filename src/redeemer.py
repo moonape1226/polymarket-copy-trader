@@ -41,6 +41,11 @@ ZERO_ADDRESS   = "0x0000000000000000000000000000000000000000"
 # Caches (conditionId, outcomeIndex) we have already attempted in this process
 # so a single API lag doesn't trigger a stream of revert-only Safe txs.
 _redeem_done_cache: set = set()
+# (condition_id, outcome_index) → preflight-revert count. A revert can mean
+# "market not resolved YET" (data-api flagged redeemable early), which clears
+# later — so retry a few cycles before caching as permanently done (M5).
+_preflight_revert_count: dict = {}
+_MAX_PREFLIGHT_REVERTS = 5
 
 # ── Minimal ABIs ───────────────────────────────────────────────────────────────
 FACTORY_ABI = [
@@ -212,13 +217,25 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
             try:
                 tx["gas"] = w3.eth.estimate_gas(tx)
             except ContractLogicError as e:
-                # Genuine on-chain revert = nothing to redeem (already redeemed,
-                # unresolved, zero balance). Safe to cache and stop retrying.
-                _redeem_done_cache.add((condition_id, outcome_index))
-                logger.info(
-                    f"Skipping {title} ({'neg-risk' if is_neg_risk else 'std'}): "
-                    f"nothing to redeem ({type(e).__name__})"
-                )
+                # Revert can mean already-redeemed/zero-balance (permanent) OR
+                # market-not-resolved-yet (clears later). Retry a few cycles
+                # before caching as done so a premature redeemable flag doesn't
+                # permanently skip the payout (M5).
+                key = (condition_id, outcome_index)
+                n = _preflight_revert_count.get(key, 0) + 1
+                _preflight_revert_count[key] = n
+                if n >= _MAX_PREFLIGHT_REVERTS:
+                    _redeem_done_cache.add(key)
+                    _preflight_revert_count.pop(key, None)
+                    logger.info(
+                        f"Skipping {title} ({'neg-risk' if is_neg_risk else 'std'}): "
+                        f"nothing to redeem after {n} attempts ({type(e).__name__})"
+                    )
+                else:
+                    logger.info(
+                        f"Redeem pre-flight revert {n}/{_MAX_PREFLIGHT_REVERTS} "
+                        f"for {title} — will retry next cycle ({type(e).__name__})"
+                    )
                 continue
             except Exception as e:
                 # Transient RPC/network error — do NOT cache, retry next cycle

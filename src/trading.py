@@ -1448,20 +1448,23 @@ class TradingModule:
                 if asset_id not in self._asset_copy_rate:
                     logger.info(f"Skipping sell: position not tracked this session — {slug}")
                     return
+                # BS is exiting — cancel ANY still-open pending buy first, even
+                # if it already partially filled. Otherwise the rest of the
+                # order keeps filling after BS left and rebuilds exposure we
+                # then can't easily exit (B-HIGH).
+                pending_oid = self._pending_order_ids.get(asset_id)
+                if pending_oid:
+                    logger.info(f"Cancelling pending buy order (BeefSlayer exiting) — {slug}")
+                    placed_at = self._pending_order_times.get(asset_id, time.time())
+                    try:
+                        self.poly.cancel_order(pending_oid)
+                        self._log_gtc_cancelled(asset_id, placed_at, "bs_exit")
+                        self._revert_pending_buy(asset_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel pending order {pending_oid[:16]}: {e}")
                 our_positions = {p.outcome_id: p for p in self.poly.fetch_positions()}
                 if asset_id not in our_positions:
-                    pending_oid = self._pending_order_ids.get(asset_id)
-                    if pending_oid:
-                        logger.info(f"Cancelling pending buy order (BeefSlayer exiting) — {slug}")
-                        placed_at = self._pending_order_times.get(asset_id, time.time())
-                        try:
-                            self.poly.cancel_order(pending_oid)
-                            self._log_gtc_cancelled(asset_id, placed_at, "bs_exit")
-                            self._revert_pending_buy(asset_id)
-                        except Exception as e:
-                            logger.warning(f"Failed to cancel pending order {pending_oid[:16]}: {e}")
-                    else:
-                        logger.info(f"Skipping sell: we don't hold {asset_id[:12]}... ({slug})")
+                    logger.info(f"Skipping sell: we don't hold {asset_id[:12]}... ({slug})")
                     return
                 our_size = min(our_size, float(our_positions[asset_id].size))
 

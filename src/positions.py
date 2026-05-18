@@ -132,17 +132,30 @@ def detect_order_changes(
 
     merged_assets: set = set()
     for cid, sells in sells_by_condition.items():
-        outcome_indices = set()
+        size_by_idx: Dict[int, float] = {}
         for s in sells:
             asset = s['asset']
             p = map_tn.get(asset) or map_tn_plus_1.get(asset)
             if p is not None:
-                outcome_indices.add(int(p.get('outcomeIndex', -1)))
-        if {0, 1}.issubset(outcome_indices):
-            title = sells[0].get('title', cid[:20])
-            logger.info(f"Detected Merge for '{title}' — skipping both sides")
-            for s in sells:
-                merged_assets.add(s['asset'])
+                idx = int(p.get('outcomeIndex', -1))
+                size_by_idx[idx] = size_by_idx.get(idx, 0.0) + float(s.get('size', 0) or 0)
+        # A real Merge burns EQUAL quantities of YES and NO. Require both
+        # outcomes present AND near-equal sold size — otherwise these are two
+        # independent exits in the same poll and must not be dropped (B-HIGH).
+        if {0, 1}.issubset(size_by_idx):
+            s0, s1 = size_by_idx[0], size_by_idx[1]
+            largest = max(s0, s1, 1e-9)
+            if abs(s0 - s1) / largest <= 0.02:
+                title = sells[0].get('title', cid[:20])
+                logger.info(f"Detected Merge for '{title}' — skipping both sides")
+                for s in sells:
+                    merged_assets.add(s['asset'])
+            else:
+                logger.info(
+                    f"Both-outcome SELL on '{sells[0].get('title', cid[:20])}' "
+                    f"but sizes differ ({s0:.2f} vs {s1:.2f}) — treating as "
+                    f"independent exits, not a Merge"
+                )
 
     if merged_assets:
         orders = [o for o in orders if o['asset'] not in merged_assets]

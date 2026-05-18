@@ -122,8 +122,14 @@ class WatchSet:
             existing = self._tokens.get(token_id)
             if existing:
                 existing["last_touch_ms"] = now_ms
-                existing["state"] = state
-                existing["source"] = source
+                # Source priority: chain (BS-held) must not be downgraded by a
+                # weather promotion, or the token becomes weather-evictable and
+                # invisible to reconciler grace logic (B-HIGH). Only overwrite
+                # source/state when the incoming source ranks >= the existing.
+                _rank = {"chain": 2, "weather_promote": 1}
+                if _rank.get(source, 0) >= _rank.get(existing.get("source", ""), 0):
+                    existing["state"] = state
+                    existing["source"] = source
             else:
                 while len(self._tokens) >= _HARD_CAP:
                     if not self._evict_one_locked():

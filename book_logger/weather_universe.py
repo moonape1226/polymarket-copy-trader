@@ -372,6 +372,14 @@ def run_loop(watch_set: WatchSet) -> None:
                     if elapsed <= _GRACE_AFTER_CLOSED_S:
                         # Within 1h grace: write final/resolution row
                         _write_row(_build_row(m, now_ms))
+                    else:
+                        # Past grace: this weather market is done. Mark its
+                        # tokens grace so they age out of the WatchSet instead
+                        # of lingering until cap eviction — the reconciler
+                        # skips weather_promote tokens by design (M9).
+                        for tid in _parse_json_field(m.get("clobTokenIds")):
+                            if tid:
+                                watch_set.mark_grace(str(tid))
 
             if complete:
                 _gc_grace_set(seen_ids)

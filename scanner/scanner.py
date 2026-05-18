@@ -211,10 +211,19 @@ def fetch_market(condition_id: str, market_id: str = "") -> dict | None:
         )
         resp.raise_for_status()
         data = resp.json()
-        if isinstance(data, list) and data:
-            return data[0]
-        if isinstance(data, dict):
-            return data
+        # This endpoint can return the WRONG market — only accept a result
+        # whose conditionId actually matches what we asked for, else the
+        # history row gets resolved against an unrelated market (B-HIGH).
+        candidates = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+        for m in candidates:
+            if isinstance(m, dict) and m.get("conditionId") == condition_id:
+                return m
+        if candidates:
+            logger.warning(
+                f"fetch_market: conditionId mismatch for {condition_id[:10]} "
+                f"(got {candidates[0].get('conditionId', '?')[:10] if isinstance(candidates[0], dict) else '?'}) — skipping"
+            )
+        return None
     except Exception as e:
         # Distinguish API/network/schema failure from "market not found" so a
         # stalled calibration is visible instead of silent (P2).
@@ -312,7 +321,8 @@ def event_correct_stats(history: list):
 
     all_by_event: dict = {}
     for r in history:
-        all_by_event.setdefault(r.get("event", "?"), []).append(r)
+        # group by stable event_slug; fall back to title for old records (M2)
+        all_by_event.setdefault(r.get("event_slug") or r.get("event", "?"), []).append(r)
 
     topic_stats: dict = {}
     for ev, rs in all_by_event.items():
@@ -394,7 +404,9 @@ def scan(history: list) -> list:
         title = event.get("title", "")
         if any(k in title.lower() for k in SKIP_TITLE_KEYWORDS):
             continue
-        tag_slugs = {t.get("slug", "") for t in event.get("tags", [])}
+        # tags/markets keys can be present but null — `or []` guards against a
+        # crash outside the per-market try (M3)
+        tag_slugs = {t.get("slug", "") for t in (event.get("tags") or [])}
         if tag_slugs & {"sports", "esports"}:
             continue
         if looks_like_sports_matchup(title):
@@ -402,7 +414,7 @@ def scan(history: list) -> list:
         event_slug = event.get("slug", "")
         url = f"{POLYMARKET_BASE}/{event_slug}"
 
-        for market in event.get("markets", []):
+        for market in (event.get("markets") or []):
             try:
                 prices = [float(p) for p in json.loads(market.get("outcomePrices", "[]"))]
                 if not prices:
@@ -425,6 +437,11 @@ def scan(history: list) -> list:
                 outcomes = json.loads(market.get("outcomes", "[]"))
                 side = outcomes[max_idx] if max_idx < len(outcomes) else "?"
                 cid = market.get("conditionId", "")
+                if not cid:
+                    # no conditionId → can't track/resolve it uniquely; empty
+                    # string would collapse many markets onto one key (M4)
+                    parse_skipped += 1
+                    continue
 
                 entry = {
                     "question": market.get("question", ""),
@@ -477,6 +494,7 @@ def scan(history: list) -> list:
                     "market_id": entry["market_id"],
                     "question": entry["question"],
                     "event": ev_title,
+                    "event_slug": slug,  # stable group key; title can collide (M2)
                     "scan_prob": max_p,
                     "scan_side": entry["side"],
                     "scanned_at": datetime.now(timezone.utc).isoformat(),
@@ -596,13 +614,23 @@ def _send_slack(events_list: list) -> bool:
                 "text": f"*<{ev['url']}|{ev['title']}>*  _{ev['days']:.1f}d_\n```" + "\n".join(lines) + "```",
             },
         })
-    try:
-        requests.post(SLACK_WEBHOOK, json={"blocks": blocks}, timeout=10).raise_for_status()
-        logger.info("Slack notification sent.")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to send Slack notification: {e}")
-        return False
+    # Slack rejects payloads >50 blocks — split into chunks so a large scan
+    # doesn't fail the whole alert (M1). Keep the header only on the first.
+    header, body = blocks[0], blocks[1:]
+    chunks: list[list] = []
+    for i in range(0, max(1, len(body)), 48):
+        part = body[i:i + 48]
+        chunks.append(([header] + part) if i == 0 else part)
+    ok = True
+    for idx, chunk in enumerate(chunks):
+        try:
+            requests.post(SLACK_WEBHOOK, json={"blocks": chunk}, timeout=10).raise_for_status()
+        except Exception as e:
+            logger.error(f"Failed to send Slack notification (part {idx+1}/{len(chunks)}): {e}")
+            ok = False
+    if ok:
+        logger.info(f"Slack notification sent ({len(chunks)} message(s)).")
+    return ok
 
 
 def _send_calibration_slack(resolved: list, correct: int, total: int, buckets: dict):
