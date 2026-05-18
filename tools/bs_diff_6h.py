@@ -263,7 +263,21 @@ def main() -> int:
         if not isinstance(wallets, list) or not wallets:
             raise ValueError("wallets_to_track missing or empty")
         bs_addr = wallets[0]
-    except (OSError, ValueError, KeyError, json.JSONDecodeError) as e:
+        if not isinstance(bs_addr, str) or not bs_addr.strip():
+            raise ValueError("wallets_to_track[0] is not a non-empty string")
+        bs_addr = bs_addr.strip()
+        # Validate numeric config up front so bad values fail as a config
+        # error before any network work, not as mid-run math garbage (T2)
+        for k, default, lo, hi in (
+            ("copy_percentage", 1.0, 0.0, 1.0),
+            ("buy_limit_slip_pct", 0.0, 0.0, 1.0),
+            ("buy_limit_slip_pct_low_prob", 0.0, 0.0, 1.0),
+            ("low_prob_price_threshold", 0.0, 0.0, 1.0),
+        ):
+            v = float(cfg.get(k, default))
+            if not (lo <= v <= hi):
+                raise ValueError(f"{k}={v} out of range [{lo}, {hi}]")
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
         print(f"config error ({CFG}): {e}", file=sys.stderr)
         return 2
     our_addr = (env.get("POLYMARKET_PROXY_ADDRESS") or os.environ.get("POLYMARKET_PROXY_ADDRESS") or "").strip()

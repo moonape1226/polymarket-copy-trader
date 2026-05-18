@@ -148,6 +148,24 @@ class WatchSet:
                 entry["state"] = "grace"
                 self._persist_locked()
 
+    def mark_grace_if_current(self, token_id: str, expect_source: str,
+                              expect_state: str, max_last_touch_ms: int) -> bool:
+        """Atomically grace `token_id` only if it still matches the snapshot
+        the caller decided on: same source/state and not touched since
+        `max_last_touch_ms`. Prevents a concurrent add() that just
+        reactivated the token from being clobbered back to grace (D3).
+        Returns True if the transition was applied."""
+        with self._lock:
+            entry = self._tokens.get(token_id)
+            if (entry is None
+                    or entry.get("source") != expect_source
+                    or entry.get("state") != expect_state
+                    or int(entry.get("last_touch_ms", 0)) > max_last_touch_ms):
+                return False
+            entry["state"] = "grace"
+            self._persist_locked()
+            return True
+
     def expire_grace(self) -> int:
         """Drop grace tokens older than _GRACE_MS. Returns count dropped."""
         cutoff = int(time.time() * 1000) - _GRACE_MS

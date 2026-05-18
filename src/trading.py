@@ -17,6 +17,24 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+class _DispatchStatus:
+    """Sentinel result for execute_copy_trade so the dispatcher can tell a
+    transient no-order outcome (retry it) from an intentional skip (keep the
+    dedup so we don't re-spam) and from a placed order (D4)."""
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<DispatchStatus {self.name}>"
+
+
+# No order was placed for a transient reason (market lookup miss, unconfirmed
+# cancel). The caller should clear dedup so poll/reconcile can retry soon.
+RETRYABLE = _DispatchStatus("RETRYABLE")
+
+
 _BOT_TRADES_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "bot_trades.csv")
 _BOT_TRADES_FIELDS = [
     "timestamp", "side", "title", "outcome", "asset_id", "condition_id",
@@ -1461,7 +1479,13 @@ class TradingModule:
                         self._log_gtc_cancelled(asset_id, placed_at, "bs_exit")
                         self._revert_pending_buy(asset_id)
                     except Exception as e:
-                        logger.warning(f"Failed to cancel pending order {pending_oid[:16]}: {e}")
+                        # Cancel unconfirmed — the buy may still be live. Do NOT
+                        # sell now: exiting while it keeps filling rebuilds
+                        # exposure. Bail; retried on the next signal (D1).
+                        logger.warning(
+                            f"Pending-buy cancel unconfirmed for {slug} "
+                            f"({pending_oid[:16]}: {e}); skipping sell this cycle")
+                        return RETRYABLE
                 our_positions = {p.outcome_id: p for p in self.poly.fetch_positions()}
                 if asset_id not in our_positions:
                     logger.info(f"Skipping sell: we don't hold {asset_id[:12]}... ({slug})")
@@ -1471,7 +1495,7 @@ class TradingModule:
             market_id = trade_change.get('conditionId') or self._get_market_id(slug)
             if not market_id:
                 logger.warning(f"Market not found for slug: {slug}")
-                return
+                return RETRYABLE
 
             # SELL: maker-with-TTL if we have BS cost basis. Skips the market sweep
             # that historically cost us ~50% slippage vs BS. Fallback to market on
@@ -1537,7 +1561,13 @@ class TradingModule:
                         self.poly.cancel_order(old_id)
                         logger.info(f"Cancelled stale pending {old_id[:16]} before re-dispatch — {slug}")
                     except Exception as e:
-                        logger.warning(f"Failed to cancel previous pending {old_id[:16]}: {e}")
+                        # Cancel unconfirmed — placing a new order now would
+                        # stack two live buys. Abort the re-dispatch; the next
+                        # reconcile/signal retries the cancel first (D1).
+                        logger.warning(
+                            f"Previous pending {old_id[:16]} cancel unconfirmed "
+                            f"({e}); skipping re-dispatch for {slug}")
+                        return RETRYABLE
                     self._log_gtc_cancelled(asset_id, placed_at, "redispatch")
                     self._revert_pending_buy(asset_id)  # also clears pending (A2)
 

@@ -68,6 +68,10 @@ def _fetch_bs_holdings(wallet: str) -> set | None:
 def _reconcile_once(watch_set: WatchSet, wallets: Iterable[str]) -> None:
     bs_holdings: set = set()
     fetch_ok = True
+    # Snapshot time BEFORE fetching holdings: a token touched after this is
+    # newer than our holdings view, so the grace decision based on this
+    # snapshot must not clobber it (D3).
+    cutoff_ms = int(time.time() * 1000)
     for w in wallets:
         held = _fetch_bs_holdings(w)
         if held is None:
@@ -94,21 +98,13 @@ def _reconcile_once(watch_set: WatchSet, wallets: Iterable[str]) -> None:
         )
         return
     for aid in watch_set.tokens():
-        # Only move chain-sourced tokens to grace; weather promotions follow
-        # their own lifecycle in weather_universe (re-promotion or eviction).
-        # Read state via watch_set state_of, source check via internal items().
-        with watch_set._lock:  # noqa: SLF001 — minimal accessor; OK in same package
-            entry = watch_set._tokens.get(aid)
-            if not entry:
-                continue
-            if entry.get("source") != "chain":
-                continue
-            if entry.get("state") != "active":
-                continue
-            if aid in bs_holdings:
-                continue
-        watch_set.mark_grace(aid)
-        transitioned += 1
+        # Only chain-sourced active tokens BS no longer holds. The conditional
+        # transition re-validates source/state/staleness atomically under the
+        # lock, so enumerating here is race-safe and needs no _tokens peek (D3).
+        if aid in bs_holdings:
+            continue
+        if watch_set.mark_grace_if_current(aid, "chain", "active", cutoff_ms):
+            transitioned += 1
 
     # 3. Drop grace entries older than 24h
     expired = watch_set.expire_grace()

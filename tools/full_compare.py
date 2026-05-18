@@ -8,7 +8,7 @@ flags sizing anomalies.
 Usage:
   python3 tools/full_compare.py [--hours 6]
 """
-import argparse, json, os, time, requests
+import argparse, json, os, sys, time, requests
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -22,7 +22,7 @@ def _default_wallets() -> tuple[str, str]:
     try:
         bs = json.loads((_REPO / "config.json").read_text())["wallets_to_track"][0]
     except Exception as e:
-        print(f"warning: could not read BS wallet from config.json: {e}")
+        print(f"warning: could not read BS wallet from config.json: {e}", file=sys.stderr)
     env_path = _REPO / ".env"
     if env_path.exists():
         for line in env_path.read_text().splitlines():
@@ -48,7 +48,7 @@ def fetch(addr, since):
         off += 500
         if off > 5000:
             if rows and rows[-1].get("timestamp", 0) >= since:
-                print("warning: pagination capped before cutoff — data incomplete")
+                print("warning: pagination capped before cutoff — data incomplete", file=sys.stderr)
             break
     return [r for r in rows if r.get("type")=="TRADE" and r.get("timestamp",0) >= since]
 

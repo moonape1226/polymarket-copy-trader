@@ -627,6 +627,8 @@ def parse_market_local_date(
     if end_date_iso:
         try:
             dt = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+            if dt.tzinfo is None:  # treat naive as UTC, not host-local (W2)
+                dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(city_tz).date().isoformat()
         except Exception:
             return None
@@ -784,6 +786,8 @@ def _hours_until(end_iso: str | None, now_ts: float) -> float | None:
         return None
     try:
         dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:  # treat naive as UTC, not host-local (W2)
+            dt = dt.replace(tzinfo=timezone.utc)
         return (dt.timestamp() - now_ts) / 3600.0
     except Exception:
         return None
@@ -1321,7 +1325,10 @@ def settle_positions(positions: list[dict], grid_cache: dict[str, dict]):
                 "t_hat_entry": f"{pos.get('t_hat_entry', ''):.2f}" if pos.get("t_hat_entry") is not None else "",
                 "sigma_entry": f"{pos.get('sigma_entry', ''):.2f}" if pos.get("sigma_entry") is not None else "",
             })
-            pos["status"] = "SETTLED"
+            # Defer SETTLED flip until the CSV append succeeds, same as the
+            # RESOLVE path — otherwise a cycle with only PENDING_EXIT rows
+            # skips the append yet still prunes the position (W1).
+            to_settle.append(pos)
             continue
 
         # OPEN — needs NWS observation; only resolve once local day has fully passed

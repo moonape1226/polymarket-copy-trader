@@ -11,7 +11,7 @@ from ratelimit import limits, sleep_and_retry
 from dotenv import load_dotenv
 
 from src.positions import get_user_positions, detect_order_changes
-from src.trading import TradingModule
+from src.trading import TradingModule, RETRYABLE
 from src.redeemer import redeem_resolved_positions
 from src.notifier import send_portfolio_update
 from src.ws_feed import WSPriceFeed
@@ -195,7 +195,10 @@ def main():
         with lock:
             try:
                 result = trading_module.execute_copy_trade(synth)
-                if result is False:
+                # False = blocked/skip; RETRYABLE = transient no-order (market
+                # miss, unconfirmed cancel). Both must clear the dedup so
+                # poll/reconcile can retry; other returns keep it (D4).
+                if result is False or result is RETRYABLE:
                     recently_dispatched.pop((aid, side), None)
                     recent_dispatch_sources.pop((aid, side), None)
             except Exception as e:

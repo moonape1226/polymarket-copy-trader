@@ -216,11 +216,24 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
             # rather than burn gas on a guaranteed-revert tx.
             try:
                 tx["gas"] = w3.eth.estimate_gas(tx)
-            except ContractLogicError as e:
-                # Revert can mean already-redeemed/zero-balance (permanent) OR
-                # market-not-resolved-yet (clears later). Retry a few cycles
-                # before caching as done so a premature redeemable flag doesn't
-                # permanently skip the payout (M5).
+            except Exception as e:
+                # An on-chain revert can surface as ContractLogicError OR as a
+                # provider ValueError/Web3RPCError whose message says
+                # "execution reverted" (R1). Treat all reverts the same:
+                # revert may be permanent (already redeemed / zero balance) or
+                # transient (market not resolved yet), so retry a few cycles
+                # before caching as done (M5). Genuine network/timeout errors
+                # stay uncached and retry forever (P2).
+                msg = str(e).lower()
+                is_revert = isinstance(e, ContractLogicError) or (
+                    "revert" in msg or "execution reverted" in msg
+                )
+                if not is_revert:
+                    logger.warning(
+                        f"Redemption pre-flight transient error for {title}, "
+                        f"will retry: {type(e).__name__}: {e}"
+                    )
+                    continue
                 key = (condition_id, outcome_index)
                 n = _preflight_revert_count.get(key, 0) + 1
                 _preflight_revert_count[key] = n
@@ -236,14 +249,6 @@ def redeem_resolved_positions(private_key: str, proxy_address: str) -> int:
                         f"Redeem pre-flight revert {n}/{_MAX_PREFLIGHT_REVERTS} "
                         f"for {title} — will retry next cycle ({type(e).__name__})"
                     )
-                continue
-            except Exception as e:
-                # Transient RPC/network error — do NOT cache, retry next cycle
-                # so a momentary outage doesn't permanently skip a payout (P2).
-                logger.warning(
-                    f"Redemption pre-flight transient error for {title}, will "
-                    f"retry: {type(e).__name__}: {e}"
-                )
                 continue
 
             signed_tx = account.sign_transaction(tx)

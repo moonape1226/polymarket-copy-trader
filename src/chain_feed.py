@@ -89,9 +89,13 @@ class ChainFeed:
         # Shared dedup + last-block state across all provider loops.
         self._seen_logs: "OrderedDict[tuple[str, str], float]" = OrderedDict()
         self._last_block: int = 0  # max block we've successfully processed
-        # While true, _handle_log must NOT advance _last_block — backfill
-        # commits the watermark per fully-successful chunk instead (A1).
-        self._in_backfill: bool = False
+        # Count of backfills in flight (two provider loops can overlap, so a
+        # bool would let one clear the guard while the other still runs — D2).
+        self._backfill_active: int = 0
+        # If set, an earlier backfill left an unfilled gap starting here:
+        # live logs must NOT advance the durable watermark past it until a
+        # later backfill heals the range (D2 watermark floor).
+        self._backfill_required_from: "int | None" = None
 
     def start(self):
         if self._thread is not None:
@@ -201,7 +205,7 @@ class ChainFeed:
         Dedup guards against overlap with live WS."""
         if self._last_block <= 0:
             return
-        self._in_backfill = True
+        self._backfill_active += 1
         try:
             loop = asyncio.get_running_loop()
             head_resp = await loop.run_in_executor(None, lambda: requests.post(
@@ -265,6 +269,12 @@ class ChainFeed:
                     if not chunk_ok:
                         break
                 if not chunk_ok:
+                    # Record the unfilled floor so live logs can't advance the
+                    # durable watermark past this gap until a later backfill
+                    # heals it (D2). Keep the earliest known gap.
+                    if (self._backfill_required_from is None
+                            or chunk_start < self._backfill_required_from):
+                        self._backfill_required_from = chunk_start
                     logger.warning(
                         f"Chain feed [{tag}]: backfill incomplete — stopped "
                         f"before block {chunk_start}, will retry on reconnect")
@@ -272,12 +282,14 @@ class ChainFeed:
                 if chunk_end > self._last_block:
                     self._last_block = chunk_end
                 chunk_start = chunk_end + 1
+            # Reached head with every chunk OK — the gap (if any) is healed.
+            self._backfill_required_from = None
             if total:
                 logger.info(f"Chain feed [{tag}]: backfill processed {total} log(s)")
         except Exception as e:
             logger.warning(f"Chain feed [{tag}]: backfill failed: {e}")
         finally:
-            self._in_backfill = False
+            self._backfill_active -= 1
 
     def _dedup_seen(self, key: tuple[str, str]) -> bool:
         """Return True if key was already processed. Otherwise mark seen."""
@@ -311,7 +323,12 @@ class ChainFeed:
             block = int(block_hex, 16)
         except (TypeError, ValueError):
             block = 0
-        if block > self._last_block and not self._in_backfill:
+        # Advance the durable watermark from a live log only when no backfill
+        # is running AND there is no unfilled gap pending — otherwise we'd
+        # "forget" a range a failed backfill still owes (D2).
+        if (block > self._last_block
+                and self._backfill_active == 0
+                and self._backfill_required_from is None):
             self._last_block = block
 
         maker = "0x" + topics[2][-40:].lower()

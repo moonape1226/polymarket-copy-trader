@@ -203,7 +203,16 @@ def fetch_market(condition_id: str, market_id: str = "") -> dict | None:
         if market_id:
             resp = requests.get(f"{GAMMA_API}/markets/{market_id}", timeout=15)
             resp.raise_for_status()
-            return resp.json()
+            m = resp.json()
+            # Validate this path too — a stale/wrong stored market_id would
+            # otherwise resolve the history row against the wrong market (S1)
+            if isinstance(m, dict) and m.get("conditionId") == condition_id:
+                return m
+            logger.warning(
+                f"fetch_market: /markets/{market_id} conditionId mismatch "
+                f"(want {condition_id[:10]}, got {m.get('conditionId', '?')[:10] if isinstance(m, dict) else '?'}) — skipping"
+            )
+            return None
         resp = requests.get(
             f"{GAMMA_API}/markets",
             params={"conditionId": condition_id},
@@ -391,9 +400,11 @@ def scan(history: list) -> list:
     cid_to_rec = {r["condition_id"]: r for r in history}
     # Track how many markets each event already has in history so the
     # MAX_MARKETS_PER_EVENT cap constrains total, not just per-scan additions.
+    # key by event_slug (fall back to title for old records) so the cap is
+    # not mis-applied when titles collide or change (S2)
     existing_per_event: dict = {}
     for r in history:
-        ev = r.get("event", "")
+        ev = r.get("event_slug") or r.get("event", "")
         existing_per_event[ev] = existing_per_event.get(ev, 0) + 1
 
     # First pass: collect all qualifying markets per event
@@ -487,7 +498,7 @@ def scan(history: list) -> list:
             is_new = cid not in existing_cids
 
             if is_new:
-                if existing_per_event.get(ev_title, 0) >= MAX_MARKETS_PER_EVENT:
+                if existing_per_event.get(slug, 0) >= MAX_MARKETS_PER_EVENT:
                     continue
                 rec: dict = {
                     "condition_id": cid,
@@ -507,7 +518,7 @@ def scan(history: list) -> list:
                 history.append(rec)
                 existing_cids.add(cid)
                 cid_to_rec[cid] = rec
-                existing_per_event[ev_title] = existing_per_event.get(ev_title, 0) + 1
+                existing_per_event[slug] = existing_per_event.get(slug, 0) + 1
 
             rec = cid_to_rec.get(cid, {})
             # Fall back to scan_prob so existing records without last_notified_prob

@@ -55,9 +55,10 @@ _WEATHER_TAG_LABELS = {
 _write_lock = threading.Lock()
 # market conditionId → first-closed-ts; cleared after _GRACE_AFTER_CLOSED_S
 _grace_started: Dict[str, float] = {}
-# market conditionId → last-seen-active-ts; used to detect markets that
-# disappeared from the active set (review #1)
-_seen_recently: Dict[str, float] = {}
+# market conditionId → {"ts": last-seen-active-ts, "tids": [token_id,...]};
+# used to detect disappeared markets (review #1) and to grace their tokens
+# even if the disappearance probe never resolves them (D5)
+_seen_recently: Dict[str, dict] = {}
 # How long after a market was last seen active do we keep checking it
 _DISAPPEAR_PROBE_WINDOW_S = 7200  # 2h — covers grace window + safety
 
@@ -277,16 +278,22 @@ def _gc_grace_set(observed_market_ids: set) -> None:
         _grace_started.pop(m, None)
 
 
-def _gc_seen_recently() -> None:
+def _gc_seen_recently(watch_set: WatchSet) -> None:
     """Drop `_seen_recently` entries past the probe window. Standalone so it
     runs every loop even when _probe_disappeared is skipped on an incomplete
-    scan — otherwise the registry grows unbounded during partial scans (A9)."""
+    scan — otherwise the registry grows unbounded during partial scans (A9).
+    Before dropping an expired cid, grace its last-known tokens so a market
+    whose disappearance probe never resolved doesn't leave its tokens active
+    until cap eviction (D5)."""
     cutoff = time.time() - _DISAPPEAR_PROBE_WINDOW_S
-    for c in [c for c, ts in _seen_recently.items() if ts < cutoff]:
+    for c in [c for c, v in _seen_recently.items() if v.get("ts", 0) < cutoff]:
+        for tid in _seen_recently[c].get("tids") or []:
+            if tid:
+                watch_set.mark_grace(str(tid))
         _seen_recently.pop(c, None)
 
 
-def _probe_disappeared(seen_now: set) -> List[Dict[str, Any]]:
+def _probe_disappeared(seen_now: set, watch_set: WatchSet) -> List[Dict[str, Any]]:
     """Review #1: closed/resolved markets disappear from `active=true&closed=false`.
     For markets we saw active recently but missing this cycle, do a targeted
     lookup so we can write a final resolution row + start the 1h grace timer.
@@ -295,11 +302,11 @@ def _probe_disappeared(seen_now: set) -> List[Dict[str, Any]]:
     """
     now = time.time()
     cutoff = now - _DISAPPEAR_PROBE_WINDOW_S
-    _gc_seen_recently()
+    _gc_seen_recently(watch_set)
     # cids we've seen in the last `_DISAPPEAR_PROBE_WINDOW_S` but didn't see this cycle
     candidates = [
-        cid for cid, last_seen in _seen_recently.items()
-        if last_seen >= cutoff and cid not in seen_now
+        cid for cid, v in _seen_recently.items()
+        if v.get("ts", 0) >= cutoff and cid not in seen_now
     ]
     if not candidates:
         return []
@@ -344,14 +351,17 @@ def run_loop(watch_set: WatchSet) -> None:
                 cid = m.get("conditionId")
                 if cid:
                     seen_ids.add(cid)
-                    _seen_recently[cid] = now_s
+                    _seen_recently[cid] = {
+                        "ts": now_s,
+                        "tids": _parse_json_field(m.get("clobTokenIds")),
+                    }
 
             # Review #1: probe markets that disappeared from the active set so
             # we capture closed/resolved transitions + final resolution rows.
             # Skip when the scan was incomplete: an unscanned tail would look
             # falsely "disappeared" and emit bogus resolution rows / grace GC
             # (#142).
-            _gc_seen_recently()  # every loop, even when probe is skipped (A9)
+            _gc_seen_recently(watch_set)  # every loop, even if probe skipped (A9)
             if not complete:
                 logger.warning(
                     "weather_universe: incomplete active scan — skipping "
@@ -359,7 +369,7 @@ def run_loop(watch_set: WatchSet) -> None:
                 )
                 disappeared: List[Dict[str, Any]] = []
             else:
-                disappeared = _probe_disappeared(seen_ids)
+                disappeared = _probe_disappeared(seen_ids, watch_set)
             for m in disappeared:
                 cid = m.get("conditionId")
                 if not cid or not _is_weather(m):
