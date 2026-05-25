@@ -120,13 +120,19 @@ def _parse_json_field(v: Any) -> list:
 def _fetch_active_weather() -> tuple[List[Dict[str, Any]], bool]:
     """Brute-force-paginate the entire active markets set. Polymarket has
     ~50k active markets at any time; default sort buries low-volume weather
-    buckets way down, so we must scan the whole tail. ~100 requests per
-    cycle at 500 per page; gamma-api comfortably handles this every 15 min.
+    buckets way down, so we must scan the whole tail. gamma-api caps page
+    size at 100 server-side regardless of requested limit, so request 100
+    explicitly — requesting more breaks the `len(data) < limit` end-of-set
+    check (the same bug that silently broke the predictor's discovery on
+    2026-05-14, see weather_predictor/predictor.py:fetch_weather_events).
     """
     out: List[Dict[str, Any]] = []
     offset = 0
-    limit = 500
-    pages_max = 200  # 100,000-market upper bound; safety guard against runaway
+    limit = 100
+    # gamma-api /markets rejects offset >= 10100 (422). Sort by endDate
+    # ascending so soonest-resolving markets (weather: daily) sit at the top
+    # of the index, well within the 10k offset cap.
+    pages_max = 100  # 10,000-market scan budget — gamma's hard offset cap
     total_scanned = 0
     complete = False  # True only if we scanned the full active set this cycle
     for _ in range(pages_max):
@@ -138,6 +144,8 @@ def _fetch_active_weather() -> tuple[List[Dict[str, Any]], bool]:
                     "closed": "false",
                     "limit": limit,
                     "offset": offset,
+                    "order": "endDate",
+                    "ascending": "true",
                 },
                 timeout=20,
             )

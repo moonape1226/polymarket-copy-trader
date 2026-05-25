@@ -42,7 +42,8 @@ logger = logging.getLogger("predictor")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DECISIONS_CSV = DATA_DIR / "paper_decisions.csv"
-_DECISIONS_MAX_BYTES = 256 * 1024 * 1024  # rotate at 256 MB (caps disk ~512 MB)
+_DECISIONS_MAX_BYTES = 1024 * 1024 * 1024  # rotate at 1 GB (~20 days at current rate)
+_DECISIONS_BACKUP_COUNT = 3                # keep .1/.2/.3 → ~80 days total history
 POSITIONS_JSON = DATA_DIR / "paper_positions.json"
 SETTLED_CSV = DATA_DIR / "paper_settled.csv"
 
@@ -741,11 +742,17 @@ def save_positions(positions: list[dict]):
 def append_csv(path: Path, fields: list[str], rows: list[dict], max_bytes: int | None = None):
     if not rows:
         return
-    # Size-based rotation: keep one rolling archive (.1) so high-volume
-    # telemetry like paper_decisions.csv can't grow unbounded (#6).
+    # Size-based rotation: keep N rolling archives (.1 ... .N) so high-volume
+    # telemetry like paper_decisions.csv retains enough history for backtests
+    # without growing unbounded. Shifts older archives down before rotating.
     if max_bytes is not None:
         try:
             if path.exists() and path.stat().st_size >= max_bytes:
+                for i in range(_DECISIONS_BACKUP_COUNT, 1, -1):
+                    src = path.with_suffix(f"{path.suffix}.{i-1}")
+                    dst = path.with_suffix(f"{path.suffix}.{i}")
+                    if src.exists():
+                        os.replace(src, dst)
                 os.replace(path, path.with_suffix(path.suffix + ".1"))
         except OSError as e:
             logger.warning("append_csv: rotation failed for %s: %s", path, e)
