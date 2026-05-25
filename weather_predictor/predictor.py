@@ -641,7 +641,7 @@ def parse_market_local_date(
 
 DECISION_FIELDS = [
     "ts", "city", "kind", "local_date", "market_slug", "bucket",
-    "side", "token_id", "t_hat", "sigma", "our_prob",
+    "side", "token_id", "t_hat", "sigma", "ensemble_std", "our_prob",
     "bid", "ask", "edge_ratio", "hours_to_close",
     "action", "reason", "cost_usd", "shares",
 ]
@@ -929,6 +929,7 @@ def evaluate_city_kind(
                 "side": side, "token_id": token_id,
                 "t_hat": f"{t_hat:.2f}" if t_hat is not None else "",
                 "sigma": f"{sigma:.2f}",
+                "ensemble_std": f"{ensemble_std:.3f}",
                 "our_prob": f"{our_prob:.4f}" if our_prob is not None else "",
                 "bid": f"{bid:.4f}" if bid is not None else "",
                 "ask": f"{ask:.4f}" if ask is not None else "",
