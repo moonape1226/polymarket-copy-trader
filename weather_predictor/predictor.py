@@ -852,21 +852,14 @@ def evaluate_city_kind(
         t_hat = fcst_extreme
         locked = False
 
-    # Bias correction: forecast t_hat is systematically biased (lowest ~+1°F
-    # cold, Miami lowest ~+1.6°F). Per-(city, kind) when available, else pooled
-    # per-kind. Applied only when not locked — observed values are ground truth
-    # and need no shift. See data/calibration.json (per_city_kind / per_kind).
-    if t_hat is not None and not locked:
-        t_hat = t_hat + bias_for(city, kind)
-
-    # σ: locked overrides all (residual 1°F). Otherwise take the larger of the
-    # per-kind empirical σ (or lookup fallback) and the live ensemble spread —
-    # the latter reflects current multi-model disagreement.
-    sigma_base = sigma_for_hours(hours, kind)
+    # σ: locked overrides (residual 1°F). Otherwise pure ensemble disagreement
+    # with a 1°F floor — no in-sample empirical σ, no in-sample bias correction.
+    # In-sample calibration breaks under regime shift (e.g. Miami spring→summer);
+    # ensemble spread is a live signal that adapts naturally.
     if locked:
         sigma = 1.0
     else:
-        sigma = max(sigma_base, ensemble_std)
+        sigma = max(ensemble_std, 1.0)
     market_cost = _market_cost_so_far(positions, city, kind, local_date)
     market_slug = event.get("slug", "")
 
@@ -908,7 +901,13 @@ def evaluate_city_kind(
         no_tok = token_ids[no_idx]
         feed.subscribe([yes_tok, no_tok])
 
-        our_prob_yes = item["raw_prob"]
+        # Tail-confidence clamp: cap our_prob at [0.05, 0.95] so the bot can
+        # never be >95% sure of a bucket outcome. Gaussian tails underestimate
+        # real-world surprise; 0.90+ NO entries against thin tails were the
+        # dominant blowup pattern (lowest NO −$708 over 6 trades). Robust
+        # across (city, kind, season) — no in-sample fit.
+        raw = item["raw_prob"]
+        our_prob_yes = max(0.05, min(0.95, raw)) if raw is not None else None
         bucket_label = _format_bucket(lo, hi)
 
         for side, token_id, our_prob in (
@@ -1452,25 +1451,14 @@ def settle_positions(positions: list[dict], grid_cache: dict[str, dict]):
 
 
 def main():
-    global _KIND_CALIBRATION, _CITY_KIND_BIAS
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _KIND_CALIBRATION = load_kind_calibration()
-    _CITY_KIND_BIAS = load_city_kind_bias()
-    if _KIND_CALIBRATION:
-        for kind in ("highest", "lowest"):
-            v = _KIND_CALIBRATION.get(kind)
-            if v:
-                logger.info(
-                    f"Kind calibration {kind}: bias={v['bias']:+.2f}°F  "
-                    f"σ={v['sigma']:.2f}°F  n={v['n']}"
-                )
-    else:
-        logger.info("Kind calibration unavailable; using σ lookup by lead time, no bias correction")
-    for k, b in sorted(_CITY_KIND_BIAS.items()):
-        logger.info(f"City-kind bias {k}: {b:+.2f}°F  (overrides per-kind)")
+    logger.info(
+        "Calibration: no in-sample bias/σ; t_hat=ensemble mean, "
+        "σ=max(ensemble_std, 1.0°F), our_prob clamped to [0.05, 0.95]"
+    )
     logger.info(
         f"Paper trader starting — {len(CITIES)} cities, cycle={CYCLE_SECONDS}s, "
-        f"sigma=variable(by lead time), edge>={EDGE_THRESHOLD_YES}/{EDGE_THRESHOLD_NO}x (YES/NO), "
+        f"sigma=max(ensemble_std,1°F), edge>={EDGE_THRESHOLD_YES}/{EDGE_THRESHOLD_NO}x (YES/NO), "
         f"max_ask={MAX_ENTRY_ASK_YES}/{MAX_ENTRY_ASK_NO} (YES/NO), "
         f"per-bucket cap=${MAX_PER_BUCKET_USD:.0f}"
     )
