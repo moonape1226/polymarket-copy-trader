@@ -70,6 +70,27 @@ def looks_like_sports_matchup(title: str) -> bool:
     return any(p.search(title) for p in SPORTS_TITLE_PATTERNS)
 
 
+# Crypto coin-price strike markets ("Bitcoin above ___ on May 7?",
+# "What price will Solana hit in April?", "Will Ethereum reach $2,600 in April?")
+# are a confirmed net-negative slice: 46/52 (88.5%), EV -1.7%, vs ex-crypto
+# EV +9.3% over the 4/22-5/19 dataset. A title is treated as crypto-price only
+# when it carries BOTH a coin token AND a price/direction hint, so crypto-adjacent
+# non-price markets (e.g. "Solana ETF approved by June?") are intentionally kept.
+_CRYPTO_COIN = re.compile(
+    r"\b(bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|dogecoin|doge|"
+    r"cardano|ada|bnb|avalanche|avax|litecoin|ltc)\b", re.IGNORECASE
+)
+_CRYPTO_PRICE_HINT = re.compile(
+    r"(above|below|\bdip\b|reach|\bhit\b|\$\s?\d|price will|be above|be below|\bprice\b)",
+    re.IGNORECASE,
+)
+
+
+def looks_like_crypto_price(text: str) -> bool:
+    t = text or ""
+    return bool(_CRYPTO_COIN.search(t) and _CRYPTO_PRICE_HINT.search(t))
+
+
 # Observational only: group resolved events by topic to expose portfolio-level
 # concentration. A stretch of Iran/Musk events resolving together is one
 # correlated bet, not N independent ones — the topic breakdown makes that visible.
@@ -422,6 +443,8 @@ def scan(history: list) -> list:
             continue
         if looks_like_sports_matchup(title):
             continue
+        if looks_like_crypto_price(title):
+            continue
         event_slug = event.get("slug", "")
         url = f"{POLYMARKET_BASE}/{event_slug}"
 
@@ -452,6 +475,10 @@ def scan(history: list) -> list:
                     # no conditionId → can't track/resolve it uniquely; empty
                     # string would collapse many markets onto one key (M4)
                     parse_skipped += 1
+                    continue
+                # Per-market guard: a generic event title can hide a coin-price
+                # strike that only shows in the question (e.g. "$80,000").
+                if looks_like_crypto_price(market.get("question", "")):
                     continue
 
                 entry = {
@@ -565,20 +592,11 @@ def scan(history: list) -> list:
             )
     logger.info(f"{'='*80}")
 
-    # Actually deliver the alert — previously _send_slack was never called so
-    # new/updated markets only ever hit the log (dead alert path).
-    # Only mark markets as notified once delivery actually succeeds; if a
-    # configured webhook fails, leave last_notified_prob so the next scan
-    # retries instead of silently dropping the alert (A4). With no webhook
-    # the scanner is log-only, so logging counts as notified.
-    if SLACK_WEBHOOK:
-        notified = False
-        try:
-            notified = _send_slack(events_list)
-        except Exception as e:
-            logger.warning(f"Slack send failed: {e}")
-    else:
-        notified = True
+    # New/updated markets are log-only by request — no Slack push. The
+    # calibration summary still goes to Slack via _send_calibration_slack.
+    # Logging counts as notified so last_notified_prob bookkeeping (and the
+    # ≥5% re-log dedup) keeps working.
+    notified = True
 
     if notified:
         for ev in events_list:
