@@ -1,5 +1,30 @@
 # Intraday Observation-Speed Edge — Live Test Spec
 
+> **STATUS: CLOSED — KILLED BY STEP 0.1 (2026-06-08). Do not build the live monitor.**
+>
+> Step 0.1 ran and failed the gate. Empirical CF6 (Polymarket's settlement source)
+> vs the best live-accessible observation (1-minute ASOS, spike-filtered, n=19 clean
+> station-days):
+> - **HIGH: 37% bucket-flip**, mean +0.58°F (95% within 1°F, but 2°F buckets flip anyway)
+> - **LOW: 32% bucket-flip**, mean +0.16°F
+>
+> The edge's core premise — "after the afternoon peak the outcome is KNOWN" — is false.
+> Even with perfect speed, our observed extreme picks a *different* 2°F settlement bucket
+> than the official CF6 ~1/3 of the time. A bucket you believe is YES-certain at 0.90 is
+> really only ~65% likely to settle YES → buying it is hugely −EV. This is a settlement-
+> source noise floor, independent of (and additional to) codex's executability objection
+> (retail REST can't beat MM sub-second CLOB-WebSocket repricing). Pincer: the only days
+> the obs lands deep-inside a bucket (flip-safe) are exactly the days the market reads it
+> just as easily and has already converged → no lag to capture. Both edges fail together.
+>
+> **Conclusion: the intraday edge — the last surviving weather-direction hypothesis — is
+> dead. The entire weather-prediction-market direction has no retail-capturable edge.**
+> Test scripts: the Step 0.1 comparison (CF6 via IEM `json/cf6.py?year=2026`, 1-min ASOS
+> via `request/asos1min.py`) is reproducible from this session's transcript.
+
+---
+
+
 ## Thesis
 
 The daily temperature high is physically determined by ~2pm local (median; 100% of
