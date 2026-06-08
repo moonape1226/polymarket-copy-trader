@@ -335,8 +335,8 @@ def calibration_stats(history: list, send_slack: bool = False):
         b = buckets[band]
         logger.info(f"    {band:8}  {b['ok']}/{b['n']} ({b['ok']/b['n']*100:.0f}%)")
 
-    if SLACK_WEBHOOK and send_slack:
-        _send_calibration_slack(resolved, correct, total, buckets)
+    # Slack push disabled by request 2026-06-08 — scanner is fully log-only now.
+    # _send_calibration_slack kept for manual re-enable.
 
 
 def event_correct_stats(history: list):
