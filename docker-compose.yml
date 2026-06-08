@@ -79,17 +79,19 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  weather-audit:
-    container_name: polymarket-weather-audit
-    build:
-      context: ./audit
-    restart: unless-stopped
-    environment:
-      - DATA_DIR=/data
-    volumes:
-      - ./data:/data
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+  # weather-audit DISABLED 2026-06-08 — weather edge dead, no downstream consumer.
+  # Re-enable by uncommenting this block.
+  # weather-audit:
+  #   container_name: polymarket-weather-audit
+  #   build:
+  #     context: ./audit
+  #   restart: unless-stopped
+  #   environment:
+  #     - DATA_DIR=/data
+  #   volumes:
+  #     - ./data:/data
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "3"
