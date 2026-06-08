@@ -32,6 +32,21 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  paper-trader:
+    container_name: polymarket-paper-trader
+    build:
+      context: ./paper_trader
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   weather-predictor:
     container_name: polymarket-weather
     build:
